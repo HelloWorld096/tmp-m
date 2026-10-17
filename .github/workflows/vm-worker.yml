@@ -1,0 +1,238 @@
+
+name: On-Demand Remote VM
+
+on:
+  workflow_dispatch:
+    inputs:
+      callback_url:
+        description: Worker registration endpoint
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporary-remote-vm
+  cancel-in-progress: false
+
+jobs:
+  vm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout infrastructure repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          python3 -m venv /tmp/vm-venv
+          /tmp/vm-venv/bin/pip install fastapi uvicorn
+
+          curl -fsSL \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb \
+            -o /tmp/cloudflared.deb
+
+          sudo dpkg -i /tmp/cloudflared.deb
+
+      - name: Obtain session token
+        id: session
+        env:
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          VM_WEBHOOK_SECRET: ${{ secrets.VM_WEBHOOK_SECRET }}
+        run: |
+          set -euo pipefail
+
+          CLAIM_URL="${CALLBACK_URL%/register}/claim"
+
+          RESPONSE=$(curl -fsS \
+            --connect-timeout 5 \
+            --max-time 15 \
+            -X POST "$CLAIM_URL" \
+            -H "Authorization: Bearer $VM_WEBHOOK_SECRET")
+
+          TOKEN=$(python3 -c \
+            'import json,sys; print(json.load(sys.stdin)["token"])' \
+            <<< "$RESPONSE")
+
+          if [ -z "$TOKEN" ]; then
+            echo "Could not obtain session token."
+            exit 1
+          fi
+
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Start command server
+        env:
+          SESSION_TOKEN: ${{ steps.session.outputs.token }}
+        run: |
+          cat > /tmp/agent.py <<'PY'
+          import os
+          import time
+          import subprocess
+          from fastapi import FastAPI, Request, HTTPException
+          import uvicorn
+
+          app = FastAPI()
+          token = os.environ["SESSION_TOKEN"]
+          current_dir = os.environ["GITHUB_WORKSPACE"]
+          last_activity = time.time()
+
+          @app.get("/health")
+          def health():
+              return {"status": "alive"}
+
+          @app.post("/exec")
+          async def execute(req: Request):
+              global current_dir, last_activity
+
+              if req.headers.get("Authorization") != f"Bearer {token}":
+                  raise HTTPException(status_code=401)
+
+              body = await req.json()
+              command = body.get("command")
+
+              if not isinstance(command, str) or not command.strip():
+                  raise HTTPException(status_code=400)
+
+              if len(command) > 20000:
+                  raise HTTPException(status_code=413)
+
+              last_activity = time.time()
+
+              with open("/tmp/vm-activity", "w") as f:
+                  f.write(str(last_activity))
+
+              # Preserve working-directory changes between commands.
+              # Each command gets its own Bash process.
+              import shlex
+              script = (
+                  f"cd {shlex.quote(current_dir)}\n"
+                  f"{command}\n"
+                  "__vm_rc=$?\n"
+                  "printf '\\n__VM_META__%s\\t%s\\n' \"$PWD\" \"$__vm_rc\"\n"
+              )
+
+              try:
+                  proc = subprocess.run(
+                      ["bash", "-lc", script],
+                      capture_output=True,
+                      text=True,
+                      timeout=240,
+                  )
+                  output = proc.stdout
+                  if proc.stderr:
+                      output += "\n" + proc.stderr
+                  exit_code = proc.returncode
+              except subprocess.TimeoutExpired:
+                  output = "Command timed out after 240 seconds."
+                  exit_code = 124
+
+              marker = "__VM_META__"
+              if marker in output:
+                  output, meta = output.rsplit(marker, 1)
+                  try:
+                      cwd, rc = meta.strip().split("\\t", 1)
+                      if os.path.isdir(cwd):
+                          current_dir = cwd
+                      exit_code = int(rc)
+                  except ValueError:
+                      pass
+
+              with open("/tmp/vm-activity", "w") as f:
+                  f.write(str(time.time()))
+
+              return {
+                  "cwd": current_dir,
+                  "exit_code": exit_code,
+                  "output": output[-20000:],
+              }
+
+          if __name__ == "__main__":
+              with open("/tmp/vm-activity", "w") as f:
+                  f.write(str(time.time()))
+
+              uvicorn.run(app, host="127.0.0.1", port=8000)
+          PY
+
+          /tmp/vm-venv/bin/python /tmp/agent.py \
+            > /tmp/agent.log 2>&1 &
+
+          echo $! > /tmp/agent.pid
+
+      - name: Start tunnel and register
+        env:
+          SESSION_TOKEN: ${{ steps.session.outputs.token }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+        run: |
+          set -euo pipefail
+
+          cloudflared tunnel --no-autoupdate \
+            --url http://127.0.0.1:8000 \
+            > /tmp/tunnel.log 2>&1 &
+
+          echo $! > /tmp/tunnel.pid
+
+          TUNNEL_URL=""
+
+          for i in $(seq 1 40); do
+            TUNNEL_URL=$(grep -Eo \
+              'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' \
+              /tmp/tunnel.log | head -n 1 || true)
+
+            if [ -n "$TUNNEL_URL" ]; then
+              break
+            fi
+
+            sleep 2
+          done
+
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "Tunnel startup failed."
+            exit 1
+          fi
+
+          export TUNNEL_URL
+
+          python3 - <<'PY' > /tmp/register.json
+          import json, os
+          print(json.dumps({
+              "tunnelUrl": os.environ["TUNNEL_URL"],
+              "token": os.environ["SESSION_TOKEN"]
+          }))
+          PY
+
+          STATUS=$(curl -sS \
+            -o /tmp/register-response \
+            -w '%{http_code}' \
+            --connect-timeout 5 \
+            --max-time 15 \
+            -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/register.json)
+
+          if [ "$STATUS" != "200" ]; then
+            echo "Runner registration failed."
+            exit 1
+          fi
+
+          rm -f /tmp/register.json /tmp/register-response
+
+      - name: Keep runner alive until idle
+        run: |
+          set -euo pipefail
+
+          while true; do
+            NOW=$(date +%s)
+            LAST=$(python3 -c \
+              'print(int(float(open("/tmp/vm-activity").read())))')
+
+            if [ $((NOW - LAST)) -ge 900 ]; then
+              echo "Idle timeout reached."
+              break
+            fi
+
+            sleep 15
+          done
