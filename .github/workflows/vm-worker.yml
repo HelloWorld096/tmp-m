@@ -26,7 +26,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install dependencies
+        shell: bash
         run: |
+          set -euo pipefail
+
           python3 -m venv /tmp/vm-venv
           /tmp/vm-venv/bin/pip install fastapi uvicorn
 
@@ -38,6 +41,7 @@ jobs:
 
       - name: Obtain session token
         id: session
+        shell: bash
         env:
           CALLBACK_URL: ${{ inputs.callback_url }}
           VM_WEBHOOK_SECRET: ${{ secrets.VM_WEBHOOK_SECRET }}
@@ -65,12 +69,16 @@ jobs:
           echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
 
       - name: Start command server
+        shell: bash
         env:
           SESSION_TOKEN: ${{ steps.session.outputs.token }}
         run: |
+          set -euo pipefail
+
           cat > /tmp/agent.py <<'PY'
           import os
           import time
+          import shlex
           import subprocess
           from fastapi import FastAPI, Request, HTTPException
           import uvicorn
@@ -78,7 +86,6 @@ jobs:
           app = FastAPI()
           token = os.environ["SESSION_TOKEN"]
           current_dir = os.environ["GITHUB_WORKSPACE"]
-          last_activity = time.time()
 
           @app.get("/health")
           def health():
@@ -86,28 +93,29 @@ jobs:
 
           @app.post("/exec")
           async def execute(req: Request):
-              global current_dir, last_activity
+              global current_dir
 
               if req.headers.get("Authorization") != f"Bearer {token}":
                   raise HTTPException(status_code=401)
 
-              body = await req.json()
+              try:
+                  body = await req.json()
+              except Exception:
+                  raise HTTPException(status_code=400, detail="Invalid JSON")
+
               command = body.get("command")
 
               if not isinstance(command, str) or not command.strip():
-                  raise HTTPException(status_code=400)
+                  raise HTTPException(status_code=400, detail="Missing command")
 
               if len(command) > 20000:
-                  raise HTTPException(status_code=413)
+                  raise HTTPException(status_code=413, detail="Command too large")
 
-              last_activity = time.time()
-
+              # Record activity before execution so long builds do not
+              # cause the idle timer to terminate the runner prematurely.
               with open("/tmp/vm-activity", "w") as f:
-                  f.write(str(last_activity))
+                  f.write(str(time.time()))
 
-              # Preserve working-directory changes between commands.
-              # Each command gets its own Bash process.
-              import shlex
               script = (
                   f"cd {shlex.quote(current_dir)}\n"
                   f"{command}\n"
@@ -122,24 +130,27 @@ jobs:
                       text=True,
                       timeout=240,
                   )
-                  output = proc.stdout
-                  if proc.stderr:
-                      output += "\n" + proc.stderr
+
+                  stdout = proc.stdout
+                  stderr = proc.stderr
                   exit_code = proc.returncode
+
+                  marker = "__VM_META__"
+                  if marker in stdout:
+                      stdout, meta = stdout.rsplit(marker, 1)
+                      try:
+                          cwd, rc = meta.strip().split("\t", 1)
+                          if os.path.isdir(cwd):
+                              current_dir = cwd
+                          exit_code = int(rc)
+                      except ValueError:
+                          pass
+
+                  output = stdout + ("\n" + stderr if stderr else "")
+
               except subprocess.TimeoutExpired:
                   output = "Command timed out after 240 seconds."
                   exit_code = 124
-
-              marker = "__VM_META__"
-              if marker in output:
-                  output, meta = output.rsplit(marker, 1)
-                  try:
-                      cwd, rc = meta.strip().split("\\t", 1)
-                      if os.path.isdir(cwd):
-                          current_dir = cwd
-                      exit_code = int(rc)
-                  except ValueError:
-                      pass
 
               with open("/tmp/vm-activity", "w") as f:
                   f.write(str(time.time()))
@@ -162,7 +173,20 @@ jobs:
 
           echo $! > /tmp/agent.pid
 
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:8000/health >/dev/null; then
+              echo "Command server is ready."
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "Command server failed to start."
+          cat /tmp/agent.log
+          exit 1
+
       - name: Start tunnel and register
+        shell: bash
         env:
           SESSION_TOKEN: ${{ steps.session.outputs.token }}
           CALLBACK_URL: ${{ inputs.callback_url }}
@@ -191,13 +215,16 @@ jobs:
 
           if [ -z "$TUNNEL_URL" ]; then
             echo "Tunnel startup failed."
+            cat /tmp/tunnel.log
             exit 1
           fi
 
           export TUNNEL_URL
 
           python3 - <<'PY' > /tmp/register.json
-          import json, os
+          import json
+          import os
+
           print(json.dumps({
               "tunnelUrl": os.environ["TUNNEL_URL"],
               "token": os.environ["SESSION_TOKEN"]
@@ -214,13 +241,15 @@ jobs:
             --data-binary @/tmp/register.json)
 
           if [ "$STATUS" != "200" ]; then
-            echo "Runner registration failed."
+            echo "Runner registration failed with HTTP $STATUS."
             exit 1
           fi
 
           rm -f /tmp/register.json /tmp/register-response
+          echo "Runner registered successfully."
 
       - name: Keep runner alive until idle
+        shell: bash
         run: |
           set -euo pipefail
 
