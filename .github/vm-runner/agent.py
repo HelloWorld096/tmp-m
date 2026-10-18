@@ -17,8 +17,10 @@ Design (see README.md and docs/OPERATIONS.md for the surrounding system):
     cancellation kill the whole tree, not just the top-level bash.
   * The working directory is tracked with an EXIT trap, so it survives
     `exit N`, and stdout/stderr stay interleaved in one stream.
-  * Child processes get a scrubbed environment (no session token, no Actions
-    runtime tokens).
+  * Child processes get a reduced environment (no session token, no Actions
+    runtime tokens). This only stops *accidental* leakage: commands run as the
+    runner user, which can usually sudo and read other processes' memory, so a
+    command can still reach the runner's secrets if it tries (docs/SECURITY.md).
   * Kill switch: POST /cancel stops whatever is running without needing its job id
     (the "Ctrl-C" for a command that loops), and with kill_background=true also
     sweeps processes that escaped the job's process group (nohup/setsid daemons).
@@ -41,7 +43,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -245,6 +247,11 @@ class JobManager:
             return self.jobs.get(job_id)
 
     def cancel(self, job: Job) -> None:
+        proc = job.proc
+        # A job that already exited (the watcher just hasn't recorded it yet) finished on its own terms;
+        # don't relabel it "cancelled".
+        if job.done.is_set() or proc is None or proc.poll() is not None:
+            return
         job.cancel_requested = True
         self._kill_group(job)
 
@@ -335,8 +342,13 @@ class JobManager:
         elif rc is not None:
             job.exit_code = rc
         else:
+            # No meta file: the shell never ran our EXIT trap (`exec cmd`, or the command replaced the
+            # trap). The process's own exit status is still right; only the working directory is lost.
             code = proc.returncode
-            job.exit_code = 128 - code if code is not None and code < 0 else (code or 1)
+            if code is None:
+                job.exit_code = 1
+            else:
+                job.exit_code = 128 - code if code < 0 else code
         job.ended = time.time()
         job.done.set()
         touch_activity()
@@ -358,19 +370,29 @@ def create_app(token: str, workspace: str) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     manager = JobManager(workspace)
 
-    def require_auth(request: Request) -> None:
+    def is_authorized(request: Request) -> bool:
         supplied = request.headers.get("Authorization", "")
-        expected = f"Bearer {token}"
-        if not hmac.compare_digest(supplied.encode(), expected.encode()):
+        return hmac.compare_digest(supplied.encode(), f"Bearer {token}".encode())
+
+    # Authentication is enforced twice on purpose. The middleware runs before any request parsing, so an
+    # unauthenticated caller gets 401 for everything (even malformed JSON) and learns nothing about the
+    # request schema; the per-route dependency keeps each route safe even if the middleware is ever changed.
+    @app.middleware("http")
+    async def auth_gate(request: Request, call_next):
+        if request.url.path != "/health" and not is_authorized(request):
+            return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+        return await call_next(request)
+
+    def require_auth(request: Request) -> None:
+        if not is_authorized(request):
             raise HTTPException(status_code=401, detail="unauthorized")
 
     @app.get("/health")
     def health():
         return {"status": "alive"}
 
-    @app.post("/jobs")
+    @app.post("/jobs", dependencies=[Depends(require_auth)])
     def submit(req: JobRequest, request: Request):
-        require_auth(request)
         if not req.command.strip():
             raise HTTPException(status_code=400, detail="Missing command")
         try:
@@ -383,9 +405,8 @@ def create_app(token: str, workspace: str) -> FastAPI:
             )
         return {"job_id": job.id, "status": job.state, "duplicate": duplicate}
 
-    @app.get("/jobs/{job_id}")
+    @app.get("/jobs/{job_id}", dependencies=[Depends(require_auth)])
     def status(job_id: str, request: Request, wait: float = 0):
-        require_auth(request)
         job = manager.get(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="unknown job")
@@ -404,18 +425,16 @@ def create_app(token: str, workspace: str) -> FastAPI:
         touch_activity()
         return {**job.describe(), "background_killed": swept}
 
-    @app.post("/jobs/{job_id}/cancel")
+    @app.post("/jobs/{job_id}/cancel", dependencies=[Depends(require_auth)])
     def cancel(job_id: str, request: Request, body: Optional[CancelRequest] = None):
-        require_auth(request)
         job = manager.get(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="unknown job")
         return do_cancel(job, bool(body and body.kill_background))
 
-    @app.post("/cancel")
+    @app.post("/cancel", dependencies=[Depends(require_auth)])
     def cancel_current(request: Request, body: Optional[CancelRequest] = None):
         """Kill switch: stop whatever is running, no job id needed. Idle agent => {"status": "idle"}."""
-        require_auth(request)
         kill_background = bool(body and body.kill_background)
         job = manager.running()
         if job is None:
