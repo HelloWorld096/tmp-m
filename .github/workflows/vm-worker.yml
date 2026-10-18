@@ -1,70 +1,83 @@
-
 name: On-Demand Remote VM
 
+# Dispatched by the Worker (POST .../actions/workflows/vm-worker.yml/dispatches).
+# There is deliberately NO input: the Worker address comes from the repository
+# variable VM_BASE_URL, so nobody who can merely dispatch this workflow can
+# redirect VM_WEBHOOK_SECRET to a server of their choosing.
 on:
   workflow_dispatch:
-    inputs:
-      callback_url:
-        description: Worker registration endpoint
-        required: true
-        type: string
 
 permissions:
   contents: read
 
+# One VM at a time. cancel-in-progress stays false on purpose: the Worker can dispatch while a build is
+# still running if /health was merely slow, and cancelling would kill that build. A VM whose agent or
+# tunnel has died ends its own run instead (see vm-runner/keepalive.sh), which releases this group.
 concurrency:
   group: temporary-remote-vm
   cancel-in-progress: false
 
+env:
+  VM_BASE_URL: ${{ vars.VM_BASE_URL }}   # e.g. https://remote-linux-vm.<account>.workers.dev
+  CLOUDFLARED_VERSION: "2026.10.1"
+  CLOUDFLARED_SHA256: "200573c872174ab449965655febadef8edfbb144ebcaa391b700b2dedbadb3cd"
+
 jobs:
   vm:
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-
+    runs-on: ubuntu-24.04          # pinned: "latest" would change the OS and Python underneath the lockfile
+    # VM_WEBHOOK_SECRET lives in this Environment (not as a repository secret), and the Environment only
+    # accepts runs from `main`. A run dispatched on any other branch - e.g. a stale branch with an older
+    # copy of this workflow - therefore cannot read it. Create it once: see docs/MIGRATION.md step 4.
+    environment: remote-vm
+    # 360 min (6 h) is the most GitHub allows for a job on a hosted runner; a larger value would be cut off
+    # at 6 h anyway. keepalive.sh also ends the VM at 6 h (VM_MAX_SECONDS) counted from the first step, so
+    # the two limits coincide and whichever fires first (usually GitHub's, by a few seconds) ends the run.
+    timeout-minutes: 360
     steps:
+      - name: Validate configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          # keepalive.sh counts the 6-hour lifetime from here, not from when it starts.
+          date +%s > /tmp/vm-started
+          if [[ ! "${VM_BASE_URL:-}" =~ ^https://[A-Za-z0-9.-]+$ ]]; then
+            echo "Repository variable VM_BASE_URL must be an https origin with no path, e.g. https://name.account.workers.dev"
+            exit 1
+          fi
+
+      # Pinned to a commit (v6.0.3). persist-credentials: false keeps the
+      # GITHUB_TOKEN out of .git/config, where any command could read it.
       - name: Checkout infrastructure repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Install dependencies
         shell: bash
         run: |
           set -euo pipefail
-
           python3 -m venv /tmp/vm-venv
-          /tmp/vm-venv/bin/pip install fastapi uvicorn
-
-          curl -fsSL \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb \
-            -o /tmp/cloudflared.deb
-
+          # requirements.txt is fully resolved and hash-locked: any package that differs from what was reviewed fails the install.
+          /tmp/vm-venv/bin/pip install --no-cache-dir --require-hashes --no-deps -r .github/vm-runner/requirements.txt
+          curl -fsSL "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64.deb" -o /tmp/cloudflared.deb
+          echo "${CLOUDFLARED_SHA256}  /tmp/cloudflared.deb" | sha256sum --check --strict -
           sudo dpkg -i /tmp/cloudflared.deb
+          # Copy the agent out of the workspace so commands can't alter the running copy's source.
+          install -m 0644 .github/vm-runner/agent.py /tmp/vm-agent.py
+          install -m 0755 .github/vm-runner/keepalive.sh /tmp/vm-keepalive.sh
 
       - name: Obtain session token
         id: session
         shell: bash
         env:
-          CALLBACK_URL: ${{ inputs.callback_url }}
           VM_WEBHOOK_SECRET: ${{ secrets.VM_WEBHOOK_SECRET }}
         run: |
           set -euo pipefail
-
-          CLAIM_URL="${CALLBACK_URL%/register}/claim"
-
-          RESPONSE=$(curl -fsS \
-            --connect-timeout 5 \
-            --max-time 15 \
-            -X POST "$CLAIM_URL" \
-            -H "Authorization: Bearer $VM_WEBHOOK_SECRET")
-
-          TOKEN=$(python3 -c \
-            'import json,sys; print(json.load(sys.stdin)["token"])' \
-            <<< "$RESPONSE")
-
-          if [ -z "$TOKEN" ]; then
-            echo "Could not obtain session token."
-            exit 1
-          fi
-
+          # The secret goes via curl's config on stdin, not argv (argv is world-readable in /proc).
+          RESPONSE=$(printf 'header = "Authorization: Bearer %s"\n' "$VM_WEBHOOK_SECRET" \
+            | curl -fsS --connect-timeout 5 --max-time 15 -X POST -K - "${VM_BASE_URL}/runner/claim")
+          TOKEN=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' <<< "$RESPONSE")
+          if [ -z "$TOKEN" ]; then echo "Could not obtain session token."; exit 1; fi
           echo "::add-mask::$TOKEN"
           echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
 
@@ -74,194 +87,63 @@ jobs:
           SESSION_TOKEN: ${{ steps.session.outputs.token }}
         run: |
           set -euo pipefail
-
-          cat > /tmp/agent.py <<'PY'
-          import os
-          import time
-          import shlex
-          import subprocess
-          from fastapi import FastAPI, Request, HTTPException
-          import uvicorn
-
-          app = FastAPI()
-          token = os.environ["SESSION_TOKEN"]
-          current_dir = os.environ["GITHUB_WORKSPACE"]
-
-          @app.get("/health")
-          def health():
-              return {"status": "alive"}
-
-          @app.post("/exec")
-          async def execute(req: Request):
-              global current_dir
-
-              if req.headers.get("Authorization") != f"Bearer {token}":
-                  raise HTTPException(status_code=401)
-
-              try:
-                  body = await req.json()
-              except Exception:
-                  raise HTTPException(status_code=400, detail="Invalid JSON")
-
-              command = body.get("command")
-
-              if not isinstance(command, str) or not command.strip():
-                  raise HTTPException(status_code=400, detail="Missing command")
-
-              if len(command) > 20000:
-                  raise HTTPException(status_code=413, detail="Command too large")
-
-              # Record activity before execution so long builds do not
-              # cause the idle timer to terminate the runner prematurely.
-              with open("/tmp/vm-activity", "w") as f:
-                  f.write(str(time.time()))
-
-              script = (
-                  f"cd {shlex.quote(current_dir)}\n"
-                  f"{command}\n"
-                  "__vm_rc=$?\n"
-                  "printf '\\n__VM_META__%s\\t%s\\n' \"$PWD\" \"$__vm_rc\"\n"
-              )
-
-              try:
-                  proc = subprocess.run(
-                      ["bash", "-lc", script],
-                      capture_output=True,
-                      text=True,
-                      timeout=240,
-                  )
-
-                  stdout = proc.stdout
-                  stderr = proc.stderr
-                  exit_code = proc.returncode
-
-                  marker = "__VM_META__"
-                  if marker in stdout:
-                      stdout, meta = stdout.rsplit(marker, 1)
-                      try:
-                          cwd, rc = meta.strip().split("\t", 1)
-                          if os.path.isdir(cwd):
-                              current_dir = cwd
-                          exit_code = int(rc)
-                      except ValueError:
-                          pass
-
-                  output = stdout + ("\n" + stderr if stderr else "")
-
-              except subprocess.TimeoutExpired:
-                  output = "Command timed out after 240 seconds."
-                  exit_code = 124
-
-              with open("/tmp/vm-activity", "w") as f:
-                  f.write(str(time.time()))
-
-              return {
-                  "cwd": current_dir,
-                  "exit_code": exit_code,
-                  "output": output[-20000:],
-              }
-
-          if __name__ == "__main__":
-              with open("/tmp/vm-activity", "w") as f:
-                  f.write(str(time.time()))
-
-              uvicorn.run(app, host="127.0.0.1", port=8000)
-          PY
-
-          /tmp/vm-venv/bin/python /tmp/agent.py \
-            > /tmp/agent.log 2>&1 &
-
+          TOKEN="$SESSION_TOKEN"
+          unset SESSION_TOKEN          # the agent must not inherit it in its environment
+          # Token is handed over on stdin; the agent also scrubs its children's environment.
+          printf '%s' "$TOKEN" | /tmp/vm-venv/bin/python /tmp/vm-agent.py > /tmp/agent.log 2>&1 &
           echo $! > /tmp/agent.pid
-
+          unset TOKEN
           for i in $(seq 1 20); do
-            if curl -fsS http://127.0.0.1:8000/health >/dev/null; then
-              echo "Command server is ready."
-              exit 0
-            fi
+            if curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1; then echo "Command server is ready."; exit 0; fi
             sleep 1
           done
-
           echo "Command server failed to start."
           cat /tmp/agent.log
           exit 1
 
-      - name: Start tunnel and register
+      # Separate step with no token in its environment: cloudflared must not inherit it.
+      - name: Start tunnel
+        shell: bash
+        run: |
+          set -euo pipefail
+          cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8000 > /tmp/tunnel.log 2>&1 &
+          echo $! > /tmp/tunnel.pid
+          TUNNEL_URL=""
+          for i in $(seq 1 40); do
+            # cloudflared also prints https://api.trycloudflare.com (Cloudflare's own API) in error lines; that is never our tunnel.
+            TUNNEL_URL=$(grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/tunnel.log | grep -v -x 'https://api\.trycloudflare\.com' | head -n 1 || true)
+            if [ -n "$TUNNEL_URL" ]; then break; fi
+            sleep 2
+          done
+          if [ -z "$TUNNEL_URL" ]; then echo "Tunnel startup failed."; cat /tmp/tunnel.log; exit 1; fi
+          echo "$TUNNEL_URL" > /tmp/tunnel-url
+
+      - name: Register runner
         shell: bash
         env:
           SESSION_TOKEN: ${{ steps.session.outputs.token }}
-          CALLBACK_URL: ${{ inputs.callback_url }}
         run: |
           set -euo pipefail
-
-          cloudflared tunnel --no-autoupdate \
-            --url http://127.0.0.1:8000 \
-            > /tmp/tunnel.log 2>&1 &
-
-          echo $! > /tmp/tunnel.pid
-
-          TUNNEL_URL=""
-
-          for i in $(seq 1 40); do
-            TUNNEL_URL=$(grep -Eo \
-              'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' \
-              /tmp/tunnel.log | head -n 1 || true)
-
-            if [ -n "$TUNNEL_URL" ]; then
-              break
-            fi
-
-            sleep 2
-          done
-
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "Tunnel startup failed."
-            cat /tmp/tunnel.log
-            exit 1
-          fi
-
-          export TUNNEL_URL
-
+          export TUNNEL_URL="$(cat /tmp/tunnel-url)"
           python3 - <<'PY' > /tmp/register.json
-          import json
-          import os
-
-          print(json.dumps({
-              "tunnelUrl": os.environ["TUNNEL_URL"],
-              "token": os.environ["SESSION_TOKEN"]
-          }))
+          import json, os
+          print(json.dumps({"tunnelUrl": os.environ["TUNNEL_URL"], "token": os.environ["SESSION_TOKEN"]}))
           PY
-
-          STATUS=$(curl -sS \
-            -o /tmp/register-response \
-            -w '%{http_code}' \
-            --connect-timeout 5 \
-            --max-time 15 \
-            -X POST "$CALLBACK_URL" \
-            -H "Content-Type: application/json" \
-            --data-binary @/tmp/register.json)
-
+          chmod 600 /tmp/register.json
+          STATUS=$(curl -sS -o /tmp/register-response -w '%{http_code}' --connect-timeout 5 --max-time 15 \
+            -X POST "${VM_BASE_URL}/runner/register" -H "Content-Type: application/json" --data-binary @/tmp/register.json)
+          rm -f /tmp/register.json
           if [ "$STATUS" != "200" ]; then
             echo "Runner registration failed with HTTP $STATUS."
             exit 1
           fi
-
-          rm -f /tmp/register.json /tmp/register-response
+          rm -f /tmp/register-response
           echo "Runner registered successfully."
 
+      # Ends when the VM has been idle for 60 minutes, when it has been up for 6 hours (always, even
+      # mid-job), or when its agent/tunnel is dead (so a replacement
+      # run is not stuck behind this one). The agent touches /tmp/vm-activity on every authenticated request
+      # and every 10 s while a job runs; mtime is read, never contents. Logic and tests: vm-runner/keepalive.sh.
       - name: Keep runner alive until idle
         shell: bash
-        run: |
-          set -euo pipefail
-
-          while true; do
-            NOW=$(date +%s)
-            LAST=$(python3 -c \
-              'print(int(float(open("/tmp/vm-activity").read())))')
-
-            if [ $((NOW - LAST)) -ge 900 ]; then
-              echo "Idle timeout reached."
-              break
-            fi
-
-            sleep 15
-          done
+        run: /tmp/vm-keepalive.sh
