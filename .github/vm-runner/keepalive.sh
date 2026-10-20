@@ -6,9 +6,9 @@
 #   * dead:  the agent or the tunnel process has been down for VM_DEAD_CHECKS consecutive checks
 #            AND nothing has touched the activity file for VM_DEAD_STALE_SECONDS.
 #
-# Why "dead" matters: the workflow uses one concurrency group with cancel-in-progress=false, so a
-# replacement VM cannot start until this run ends. Without this check a crashed agent would block
-# every replacement for up to the idle timeout. The staleness condition is what keeps a *busy* VM
+# Why "dead" matters: only one VM run may exist at a time (the Worker will not dispatch while a run is
+# active, and the workflow's first step refuses a second one), so a replacement cannot start until this
+# run ends. Without this check a crashed agent would block every replacement for up to the idle timeout. The staleness condition is what keeps a *busy* VM
 # safe: a running job touches the activity file every ~10 s, so a slow /health caused by a CPU-bound
 # build can never get a live build killed.
 #

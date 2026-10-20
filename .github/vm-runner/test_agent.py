@@ -4,6 +4,7 @@ exercised for real (a TestClient would hide the blocking-handler bug).
 Run:  pip install -r requirements-dev.txt && pytest -q
 """
 import os
+from pathlib import Path
 import socket
 import threading
 import time
@@ -343,7 +344,7 @@ def test_keepalive_exits_when_idle(tmp_path):
 
 def test_keepalive_exits_when_agent_and_tunnel_are_dead_and_idle(tmp_path):
     p = _keepalive(tmp_path, activity_age=200, health_url="http://127.0.0.1:1/", pid=2**22 + 12345)
-    assert _finishes(p, 15), "a dead VM must release the concurrency group"
+    assert _finishes(p, 15), "a dead VM must end its run so a replacement may start"
     assert "replacement" in p.stdout.read()
 
 
@@ -428,3 +429,91 @@ def test_cancelling_an_already_finished_job_does_not_relabel_it(server):
     jid = r["job_id"]
     c = httpx.post(f"{server['url']}/jobs/{jid}/cancel", headers=H(), timeout=30).json()
     assert c["status"] == "finished" and c["exit_code"] == 0
+
+
+def test_relay_endpoint_requires_auth_and_validates_mode(server):
+    payload = {"mode": "exec", "repo": "o/relay-test", "path": "/tmp/out", "token": TOKEN,
+               "request_id": "a" * 32, "timeout_seconds": 60}
+    assert httpx.post(f"{server['url']}/relay/jobs", json=payload).status_code == 401
+    r = httpx.post(f"{server['url']}/relay/jobs", json=payload, headers=H())
+    assert r.status_code == 422  # only recv/put are accepted; no shell-command field exists
+
+
+def test_relay_endpoint_runs_only_installed_script_and_removes_token_file(server, tmp_path, monkeypatch):
+    """The Relay API invokes the pinned script path and never passes the token in argv/output."""
+    script = tmp_path / "relay.sh"
+    script.write_text("#!/usr/bin/env bash\nprintf 'mode=%s repo=%s path=%s\\n' \"$1\" \"$2\" \"$3\"\n"
+                     "test -r \"$RELAY_TOKEN_FILE\"\n"
+                     "stat -c '%a' \"$RELAY_TOKEN_FILE\"\n")
+    script.chmod(0o755)
+    monkeypatch.setattr(server["agent"], "RELAY_SCRIPT", script)
+    payload = {"mode": "recv", "repo": "owner/relay-test", "path": "/tmp/target.bin",
+               "token": "secret-token-abcdefghijklmnopqrstuvwxyz", "request_id": "b" * 32,
+               "timeout_seconds": 30}
+    r = httpx.post(f"{server['url']}/relay/jobs", json=payload, headers=H(), timeout=10)
+    assert r.status_code == 200, r.text
+    job_id = r.json()["job_id"]
+    result = httpx.get(f"{server['url']}/jobs/{job_id}", params={"wait": 10}, headers=H(), timeout=15)
+    assert result.status_code == 200
+    body = result.json()
+    assert body["status"] == "finished" and body["exit_code"] == 0, body
+    assert "mode=recv repo=owner/relay-test path=/tmp/target.bin" in body["output"]
+    assert "600" in body["output"]
+    assert payload["token"] not in body["output"]
+    assert not list((Path(os.environ["VM_JOBS_DIR"])).glob("relay-token-*"))
+
+
+def _relay_payload(**over):
+    p = {"mode": "recv", "repo": "owner/relay-test", "path": "/tmp/target.bin",
+         "token": "ghs_abcdefghijklmnopqrstuvwxyz0123456789", "request_id": "c" * 32, "timeout_seconds": 30}
+    p.update(over)
+    return p
+
+
+@pytest.mark.parametrize("bad", [
+    {"token": 'abcdefghijklmnopqrstuvwxyz"\noutput = /tmp/pwn'},   # would break out of a curl config line
+    {"token": "abcdefghijklmnopqrstuvwxyz with spaces"},
+    {"token": "short"},
+    {"repo": "../relay-test"},
+    {"repo": "owner/.."},
+    {"repo": "./x"},
+    {"repo": "../.."},
+])
+def test_relay_endpoint_rejects_hostile_token_and_repo(server, bad):
+    r = httpx.post(f"{server['url']}/relay/jobs", json=_relay_payload(**bad), headers=H(), timeout=10)
+    assert r.status_code == 422, (bad, r.text)
+    assert not list(Path(os.environ["VM_JOBS_DIR"]).glob("relay-token-*"))
+
+
+def test_relay_token_file_is_removed_even_when_the_job_is_sigkilled(server, tmp_path, monkeypatch):
+    """A job that ignores SIGTERM is SIGKILLed after the grace period; its EXIT trap never runs, so the agent
+    itself must delete the token file."""
+    script = tmp_path / "relay-stubborn.sh"
+    script.write_text("#!/usr/bin/env bash\ntrap '' TERM INT\ntest -r \"$RELAY_TOKEN_FILE\" && echo started\nsleep 60\n")
+    script.chmod(0o755)
+    monkeypatch.setattr(server["agent"], "RELAY_SCRIPT", script)
+    monkeypatch.setattr(server["agent"], "KILL_GRACE_SECONDS", 1)
+    r = httpx.post(f"{server['url']}/relay/jobs", json=_relay_payload(request_id="d" * 32, timeout_seconds=1),
+                   headers=H(), timeout=10)
+    assert r.status_code == 200, r.text
+    jid = r.json()["job_id"]
+    deadline = time.time() + 20
+    body = {}
+    while time.time() < deadline:
+        body = httpx.get(f"{server['url']}/jobs/{jid}", params={"wait": 5}, headers=H(), timeout=15).json()
+        if body.get("status") != "running":
+            break
+    assert body.get("status") != "running", body
+    assert not list(Path(os.environ["VM_JOBS_DIR"]).glob("relay-token-*")), "token file survived a SIGKILL"
+
+
+def test_status_endpoint_reports_busy_so_transfers_can_be_refused_early(server):
+    assert httpx.get(f"{server['url']}/status").status_code == 401
+    assert httpx.get(f"{server['url']}/status", headers=H()).json() == {"busy": False, "job_id": None}
+    r = httpx.post(f"{server['url']}/jobs", json={"command": "sleep 3"}, headers=H(), timeout=10)
+    jid = r.json()["job_id"]
+    st = httpx.get(f"{server['url']}/status", headers=H()).json()
+    assert st == {"busy": True, "job_id": jid}
+    httpx.post(f"{server['url']}/cancel", json={"job_id": jid}, headers=H(), timeout=15)
+    httpx.get(f"{server['url']}/jobs/{jid}", params={"wait": 10}, headers=H(), timeout=15)
+    assert httpx.get(f"{server['url']}/status", headers=H()).json()["busy"] is False

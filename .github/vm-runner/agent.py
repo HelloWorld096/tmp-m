@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import hmac
 import os
+import re
+import secrets
 import shlex
 import signal
 import subprocess
@@ -41,11 +43,11 @@ import time
 import uuid
 from collections import OrderedDict
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 MAX_COMMAND_CHARS = 20_000
 DEFAULT_JOB_SECONDS = 900
@@ -65,6 +67,8 @@ JOB_MARK_VAR = "VM_AGENT_JOB"
 
 ACTIVITY_FILE = Path(os.environ.get("VM_ACTIVITY_FILE", "/tmp/vm-activity"))
 JOBS_DIR = Path(os.environ.get("VM_JOBS_DIR", "/tmp/vm-jobs"))
+# Installed root-owned by the pinned Actions workflow, outside the mutable checkout. Tests may override.
+RELAY_SCRIPT = Path(os.environ.get("VM_RELAY_SCRIPT", "/opt/relay/relay.sh"))
 
 
 def touch_activity() -> None:
@@ -145,6 +149,9 @@ class Job:
         self.exit_code: Optional[int] = None
         self.cwd: Optional[str] = None
         self.proc: Optional[subprocess.Popen] = None
+        # Files that must not outlive the job (e.g. a Relay token file), removed by the watcher even when the
+        # job's own EXIT trap could not run because the process was SIGKILLed on timeout or cancel.
+        self.cleanup_files: list[Path] = []
 
     @property
     def state(self) -> str:
@@ -201,7 +208,7 @@ class JobManager:
         JOBS_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     # -- lifecycle ---------------------------------------------------------
-    def submit(self, command: str, timeout: int, request_id: Optional[str] = None) -> tuple[Job, bool]:
+    def submit(self, command: str, timeout: int, request_id: Optional[str] = None, cleanup_files: Optional[list[Path]] = None) -> tuple[Job, bool]:
         """Start a job. Returns (job, duplicate); duplicate=True means request_id was already seen."""
         with self.lock:
             # Replay check comes first: a retry of a submission that already started must get its own
@@ -213,6 +220,7 @@ class JobManager:
             job_dir = JOBS_DIR / uuid.uuid4().hex
             job_dir.mkdir(mode=0o700)
             job = Job(command, timeout, job_dir, request_id)
+            job.cleanup_files = list(cleanup_files or [])
             job.output_path.touch(mode=0o600)
             script = (
                 f"cd -- {shlex.quote(self.cwd)} 2>/dev/null || cd -- {shlex.quote(self.workspace)}\n"
@@ -241,6 +249,10 @@ class JobManager:
         touch_activity()
         threading.Thread(target=self._watch, args=(job,), daemon=True).start()
         return job, False
+
+    def find_request(self, request_id: str) -> Optional[Job]:
+        with self.lock:
+            return self.by_request.get(request_id)
 
     def get(self, job_id: str) -> Optional[Job]:
         with self.lock:
@@ -324,6 +336,11 @@ class JobManager:
             proc.wait(timeout=KILL_GRACE_SECONDS + 5)
         except subprocess.TimeoutExpired:
             pass
+        for f in job.cleanup_files:
+            try:
+                f.unlink(missing_ok=True)
+            except OSError:
+                pass
 
         cwd, rc = None, None
         try:
@@ -360,6 +377,24 @@ class JobRequest(BaseModel):
     request_id: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{32}$")
 
 
+class RelayJobRequest(BaseModel):
+    mode: Literal["recv", "put"]
+    repo: str = Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", max_length=200)
+    path: str = Field(min_length=1, max_length=4096)
+    # GitHub App installation tokens are [A-Za-z0-9_]; refuse anything that could break out of a curl config
+    # line (quotes, newlines, spaces) rather than trusting the caller.
+    token: str = Field(pattern=r"^[A-Za-z0-9_-]{20,512}$")
+    request_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    timeout_seconds: int = Field(default=1800, ge=1, le=MAX_JOB_SECONDS)
+
+    @field_validator("repo")
+    @classmethod
+    def _no_dot_segments(cls, v: str) -> str:
+        if any(part in (".", "..") for part in v.split("/")):
+            raise ValueError("repo must not contain '.' or '..' segments")
+        return v
+
+
 class CancelRequest(BaseModel):
     kill_background: bool = False
 
@@ -391,6 +426,13 @@ def create_app(token: str, workspace: str) -> FastAPI:
     def health():
         return {"status": "alive"}
 
+    @app.get("/status", dependencies=[Depends(require_auth)])
+    def agent_status():
+        """Is a job running right now? Lets the Worker refuse a transfer BEFORE it creates a repo and a token."""
+        cur = manager.current
+        busy = cur is not None and not cur.done.is_set()
+        return {"busy": busy, "job_id": cur.id if busy else None}
+
     @app.post("/jobs", dependencies=[Depends(require_auth)])
     def submit(req: JobRequest, request: Request):
         if not req.command.strip():
@@ -404,6 +446,39 @@ def create_app(token: str, workspace: str) -> FastAPI:
                 status_code=409, content={"error": "busy", "job_id": busy.job_id}
             )
         return {"job_id": job.id, "status": job.state, "duplicate": duplicate}
+
+    @app.post("/relay/jobs", dependencies=[Depends(require_auth)])
+    def submit_relay(req: RelayJobRequest, request: Request):
+        """Start only the Runner-side half of a Relay transfer; credentials never enter shell argv."""
+        existing = manager.find_request(req.request_id)
+        if existing is not None:
+            touch_activity()
+            return {"job_id": existing.id, "status": existing.state, "duplicate": True}
+        script = RELAY_SCRIPT
+        if not script.is_file() or not os.access(script, os.X_OK):
+            raise HTTPException(status_code=503, detail="approved relay.sh is not installed on this runner")
+        token_file = JOBS_DIR / ("relay-token-" + secrets.token_hex(16))
+        try:
+            fd = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as stream:
+                stream.write(req.token)
+            qtoken = shlex.quote(str(token_file))
+            command = (
+                f"( trap 'rm -f -- {qtoken}' EXIT; trap 'exit 143' TERM INT; "
+                f"export RELAY_TOKEN_FILE={qtoken}; "
+                f"{shlex.quote(str(script))} {req.mode} {shlex.quote(req.repo)} {shlex.quote(req.path)} )"
+            )
+            job, duplicate = manager.submit(command, req.timeout_seconds, req.request_id, cleanup_files=[token_file])
+            if duplicate:
+                token_file.unlink(missing_ok=True)
+            touch_activity()
+            return {"job_id": job.id, "status": job.state, "duplicate": duplicate}
+        except Busy as busy:
+            token_file.unlink(missing_ok=True)
+            return JSONResponse(status_code=409, content={"error": "busy", "job_id": busy.job_id})
+        except Exception:
+            token_file.unlink(missing_ok=True)
+            raise
 
     @app.get("/jobs/{job_id}", dependencies=[Depends(require_auth)])
     def status(job_id: str, request: Request, wait: float = 0):

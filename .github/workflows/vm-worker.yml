@@ -65,6 +65,9 @@ jobs:
           # Copy the agent out of the workspace so commands can't alter the running copy's source.
           install -m 0644 .github/vm-runner/agent.py /tmp/vm-agent.py
           install -m 0755 .github/vm-runner/keepalive.sh /tmp/vm-keepalive.sh
+          # Install the approved Relay script outside the mutable checkout.
+          sudo install -d -o root -g root -m 0755 /opt/relay
+          sudo install -o root -g root -m 0755 .github/vm-runner/relay.sh /opt/relay/relay.sh
 
       - name: Obtain session token
         id: session
