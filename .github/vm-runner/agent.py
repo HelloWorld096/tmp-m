@@ -383,7 +383,7 @@ class RelayJobRequest(BaseModel):
     path: str = Field(min_length=1, max_length=4096)
     # GitHub App installation tokens are [A-Za-z0-9_]; refuse anything that could break out of a curl config
     # line (quotes, newlines, spaces) rather than trusting the caller.
-    token: str = Field(pattern=r"^[A-Za-z0-9_-]{20,512}$")
+    token: str = Field(pattern=r"^[A-Za-z0-9_.-]{20,512}$")
     request_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     timeout_seconds: int = Field(default=1800, ge=1, le=MAX_JOB_SECONDS)
 
