@@ -49,6 +49,11 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
+try:  # session persistence is optional: without these files the agent behaves exactly as before
+    import vm_session
+except ImportError:  # pragma: no cover
+    vm_session = None
+
 MAX_COMMAND_CHARS = 20_000
 DEFAULT_JOB_SECONDS = 900
 MAX_JOB_SECONDS = 3_600
@@ -64,6 +69,10 @@ SENSITIVE_ENV_PREFIXES = ("ACTIONS_RUNTIME", "ACTIONS_ID_TOKEN", "ACTIONS_CACHE"
 # Every job's environment carries this variable. Processes inherit it even after they leave the job's
 # process group (nohup/setsid), which is how the kill switch finds them again.
 JOB_MARK_VAR = "VM_AGENT_JOB"
+# Optional confinement of sweep_marked_processes. UNSET in production (the sweep then reaches every marked process of
+# this user, as before). The test suite sets it to a per-run value so that running the tests inside an agent job
+# cannot kill that job: jobs inherit the variable, unrelated marked processes do not carry it.
+SWEEP_SCOPE_VAR = "VM_AGENT_SWEEP_SCOPE"
 
 ACTIVITY_FILE = Path(os.environ.get("VM_ACTIVITY_FILE", "/tmp/vm-activity"))
 JOBS_DIR = Path(os.environ.get("VM_JOBS_DIR", "/tmp/vm-jobs"))
@@ -103,6 +112,8 @@ def sweep_marked_processes() -> int:
     """
     me = os.getpid()
     needle = (JOB_MARK_VAR + "=").encode()
+    scope = os.environ.get(SWEEP_SCOPE_VAR)
+    scope_item = f"{SWEEP_SCOPE_VAR}={scope}".encode() if scope else None
     killed = 0
     try:
         pids = [int(n) for n in os.listdir("/proc") if n.isdigit()]
@@ -116,7 +127,8 @@ def sweep_marked_processes() -> int:
                 env = fh.read()
         except OSError:
             continue
-        if any(item.startswith(needle) for item in env.split(b"\0")):
+        items = env.split(b"\0")
+        if any(item.startswith(needle) for item in items) and (scope_item is None or scope_item in items):
             try:
                 os.kill(pid, signal.SIGKILL)
                 killed += 1
@@ -152,6 +164,7 @@ class Job:
         # Files that must not outlive the job (e.g. a Relay token file), removed by the watcher even when the
         # job's own EXIT trap could not run because the process was SIGKILLed on timeout or cancel.
         self.cleanup_files: list[Path] = []
+        self.in_container = False
 
     @property
     def state(self) -> str:
@@ -198,9 +211,10 @@ class Job:
 
 
 class JobManager:
-    def __init__(self, workspace: str):
+    def __init__(self, workspace: str, session=None):
         self.workspace = workspace
         self.cwd = workspace
+        self.session = session          # vm_session.SessionManager or None (legacy host mode)
         self.lock = threading.Lock()
         self.current: Optional[Job] = None
         self.jobs: "OrderedDict[str, Job]" = OrderedDict()
@@ -208,8 +222,13 @@ class JobManager:
         JOBS_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     # -- lifecycle ---------------------------------------------------------
-    def submit(self, command: str, timeout: int, request_id: Optional[str] = None, cleanup_files: Optional[list[Path]] = None) -> tuple[Job, bool]:
-        """Start a job. Returns (job, duplicate); duplicate=True means request_id was already seen."""
+    def submit(self, command: str, timeout: int, request_id: Optional[str] = None, cleanup_files: Optional[list[Path]] = None,
+               on_host: bool = False) -> tuple[Job, bool]:
+        """Start a job. Returns (job, duplicate); duplicate=True means request_id was already seen.
+
+        With a session attached the command runs inside the session container, except ``on_host`` jobs (the relay
+        transfer scripts, which need relay.sh and docker). May raise ``vm_session.Unavailable`` (-> HTTP 503).
+        """
         with self.lock:
             # Replay check comes first: a retry of a submission that already started must get its own
             # job back, not "busy" (the job it started is what is keeping the agent busy).
@@ -217,21 +236,34 @@ class JobManager:
                 return self.by_request[request_id], True
             if self.current is not None and not self.current.done.is_set():
                 raise Busy(self.current.id)
+            if self.session is not None:
+                self.session.acquire_job()      # raises Unavailable while restoring/capturing/failed/stopping
             job_dir = JOBS_DIR / uuid.uuid4().hex
             job_dir.mkdir(mode=0o700)
             job = Job(command, timeout, job_dir, request_id)
+            job.in_container = self.session is not None and not on_host
             job.cleanup_files = list(cleanup_files or [])
             job.output_path.touch(mode=0o600)
+            if job.in_container:
+                start, fallback = self.session.workdir, vm_session.vc.DEFAULT_WORKDIR
+            else:
+                start, fallback = self.cwd, self.workspace
             script = (
-                f"cd -- {shlex.quote(self.cwd)} 2>/dev/null || cd -- {shlex.quote(self.workspace)}\n"
+                f"cd -- {shlex.quote(start)} 2>/dev/null || cd -- {shlex.quote(fallback)}\n"
                 # EXIT trap: runs after the user's last command *and* after `exit N`.
                 f"trap '__vm_rc=$?; printf \"%s\\t%s\" \"$PWD\" \"$__vm_rc\" > {shlex.quote(str(job.meta_path))}' EXIT\n"
                 f"{command}\n"
             )
             out = open(job.output_path, "ab", buffering=0)
             try:
+                if job.in_container:
+                    # `docker exec` client on the host; the job itself lives in the container. Only VM_AGENT_JOB,
+                    # TERM and DEBIAN_FRONTEND reach it (see SessionContainer.exec_argv): no runner secrets.
+                    argv = self.session.container.exec_argv(script, job.id, start)
+                else:
+                    argv = ["bash", "--noprofile", "--norc", "-c", script]
                 job.proc = subprocess.Popen(
-                    ["bash", "-lc", script],
+                    argv,
                     stdin=subprocess.DEVNULL,
                     stdout=out,
                     stderr=subprocess.STDOUT,
@@ -239,6 +271,10 @@ class JobManager:
                     env=scrubbed_env(job.id),
                     close_fds=True,
                 )
+            except BaseException:
+                if self.session is not None:
+                    self.session.release_job()
+                raise
             finally:
                 out.close()
             self.current = job
@@ -265,7 +301,7 @@ class JobManager:
         if job.done.is_set() or proc is None or proc.poll() is not None:
             return
         job.cancel_requested = True
-        self._kill_group(job)
+        self._kill(job)
 
     def running(self) -> Optional[Job]:
         with self.lock:
@@ -290,6 +326,24 @@ class JobManager:
                 old.dir.rmdir()
             except OSError:
                 pass
+
+    def _kill(self, job: Job) -> None:
+        self._kill_group(job)
+        if job.in_container and self.session is not None:
+            try:
+                self.session.container.kill_job(job.id)     # the in-container process tree outlives the docker client
+            except Exception:
+                pass
+
+    def sweep(self) -> int:
+        """kill_background: processes that escaped a job's process group, on the host and in the container."""
+        n = sweep_marked_processes()
+        if self.session is not None:
+            try:
+                self.session.container.kill_all_jobs()
+            except Exception:
+                pass
+        return n
 
     @staticmethod
     def _kill_group(job: Job) -> None:
@@ -321,13 +375,13 @@ class JobManager:
                 last_touch = now
             if now > deadline and not job.timed_out:
                 job.timed_out = True
-                self._kill_group(job)
+                self._kill(job)
                 break
             try:
                 if job.output_path.stat().st_size > MAX_OUTPUT_BYTES:
                     job.truncated_by_size = True
                     job.cancel_requested = True
-                    self._kill_group(job)
+                    self._kill(job)
                     break
             except OSError:
                 pass
@@ -349,9 +403,12 @@ class JobManager:
             cwd, rc = cwd_s, int(rc_s)
         except (OSError, ValueError):
             pass
-        if cwd and os.path.isdir(cwd):
-            self.cwd = cwd
-        job.cwd = self.cwd
+        if self.session is not None and not job.in_container:
+            job.cwd = self.session.workdir      # a host-side relay job: the session's directory is what matters
+        else:
+            if cwd and (job.in_container or os.path.isdir(cwd)):
+                self.cwd = cwd
+            job.cwd = self.cwd
         if job.timed_out:
             job.exit_code = 124
         elif job.cancel_requested:
@@ -368,6 +425,8 @@ class JobManager:
                 job.exit_code = 128 - code if code < 0 else code
         job.ended = time.time()
         job.done.set()
+        if self.session is not None:
+            self.session.release_job(job.cwd if job.in_container else None)
         touch_activity()
 
 
@@ -399,11 +458,70 @@ class CancelRequest(BaseModel):
     kill_background: bool = False
 
 
-def create_app(token: str, workspace: str) -> FastAPI:
+class SaveRequest(BaseModel):
+    wait_seconds: float = Field(default=20, ge=0, le=50)
+
+
+class ShutdownRequest(BaseModel):
+    force: bool = False
+
+
+class SaveRunner:
+    """Runs SessionManager.save() on a thread so a multi-gigabyte save never has to fit in one HTTP request.
+
+    POST /session/save waits a few seconds for the answer; if the save is still running it returns 202 and the caller
+    polls /status (``session.capturing``, ``session.progress``, ``session.last_save``, ``session.save_error``)."""
+
+    def __init__(self, session):
+        self.session = session
+        self._lock = threading.Lock()
+        self._done: Optional[threading.Event] = None
+        self._outcome: Optional[tuple] = None
+
+    def start(self, reason: str) -> threading.Event:
+        with self._lock:
+            if self._done is not None and not self._done.is_set():
+                return self._done           # already running: join it
+            done = threading.Event()
+            self._done, self._outcome = done, None
+
+            def run() -> None:
+                try:
+                    self._outcome = ("ok", self.session.save(reason))
+                except BaseException as err:  # noqa: BLE001 - reported to the caller, never raised in the thread
+                    self._outcome = ("error", err)
+                finally:
+                    done.set()
+
+            threading.Thread(target=run, name="session-save", daemon=True).start()
+            return done
+
+    @property
+    def outcome(self) -> Optional[tuple]:
+        return self._outcome
+
+
+def _unavailable(err) -> JSONResponse:
+    return JSONResponse(status_code=503, content={"error": err.reason, "detail": err.detail})
+
+
+def create_app(token: str, workspace: str, session=None) -> FastAPI:
+    """``session`` is a ``vm_session.SessionManager`` (persistent-session mode) or None (the original behaviour)."""
     if not token:
         raise ValueError("session token must not be empty")
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-    manager = JobManager(workspace)
+    manager = JobManager(workspace, session)
+    saver = SaveRunner(session) if session is not None else None
+
+    def kill_jobs() -> None:
+        job = manager.running()
+        if job is not None:
+            manager.cancel(job)
+            job.done.wait(timeout=KILL_GRACE_SECONDS + 10)
+        manager.sweep()
+
+    if session is not None:
+        session.set_kill_jobs(kill_jobs)
 
     def is_authorized(request: Request) -> bool:
         supplied = request.headers.get("Authorization", "")
@@ -431,7 +549,10 @@ def create_app(token: str, workspace: str) -> FastAPI:
         """Is a job running right now? Lets the Worker refuse a transfer BEFORE it creates a repo and a token."""
         cur = manager.current
         busy = cur is not None and not cur.done.is_set()
-        return {"busy": busy, "job_id": cur.id if busy else None}
+        out = {"busy": busy, "job_id": cur.id if busy else None}
+        if session is not None:
+            out["session"] = session.status()
+        return out
 
     @app.post("/jobs", dependencies=[Depends(require_auth)])
     def submit(req: JobRequest, request: Request):
@@ -445,6 +566,8 @@ def create_app(token: str, workspace: str) -> FastAPI:
             return JSONResponse(
                 status_code=409, content={"error": "busy", "job_id": busy.job_id}
             )
+        except vm_session.Unavailable as err:
+            return _unavailable(err)
         return {"job_id": job.id, "status": job.state, "duplicate": duplicate}
 
     @app.post("/relay/jobs", dependencies=[Depends(require_auth)])
@@ -463,12 +586,21 @@ def create_app(token: str, workspace: str) -> FastAPI:
             with os.fdopen(fd, "w") as stream:
                 stream.write(req.token)
             qtoken = shlex.quote(str(token_file))
-            command = (
-                f"( trap 'rm -f -- {qtoken}' EXIT; trap 'exit 143' TERM INT; "
-                f"export RELAY_TOKEN_FILE={qtoken}; "
-                f"{shlex.quote(str(script))} {req.mode} {shlex.quote(req.repo)} {shlex.quote(req.path)} )"
-            )
-            job, duplicate = manager.submit(command, req.timeout_seconds, req.request_id, cleanup_files=[token_file])
+            if session is not None:
+                # The transfer starts/ends INSIDE the session container: relay.sh runs on the host against a staging
+                # directory and docker cp moves the file across (relay.sh itself is hash-pinned and unchanged).
+                command = vm_session.relay_script(
+                    session.container, req.mode, str(script), req.repo, req.path, str(token_file), str(JOBS_DIR),
+                    cwd=session.workdir,
+                )
+            else:
+                command = (
+                    f"( trap 'rm -f -- {qtoken}' EXIT; trap 'exit 143' TERM INT; "
+                    f"export RELAY_TOKEN_FILE={qtoken}; "
+                    f"{shlex.quote(str(script))} {req.mode} {shlex.quote(req.repo)} {shlex.quote(req.path)} )"
+                )
+            job, duplicate = manager.submit(command, req.timeout_seconds, req.request_id, cleanup_files=[token_file],
+                                            on_host=session is not None)
             if duplicate:
                 token_file.unlink(missing_ok=True)
             touch_activity()
@@ -476,6 +608,9 @@ def create_app(token: str, workspace: str) -> FastAPI:
         except Busy as busy:
             token_file.unlink(missing_ok=True)
             return JSONResponse(status_code=409, content={"error": "busy", "job_id": busy.job_id})
+        except vm_session.Unavailable as err:
+            token_file.unlink(missing_ok=True)
+            return _unavailable(err)
         except Exception:
             token_file.unlink(missing_ok=True)
             raise
@@ -496,7 +631,7 @@ def create_app(token: str, workspace: str) -> FastAPI:
         if not job.done.is_set():
             manager.cancel(job)
             job.done.wait(timeout=KILL_GRACE_SECONDS + 10)
-        swept = sweep_marked_processes() if kill_background else 0
+        swept = manager.sweep() if kill_background else 0
         touch_activity()
         return {**job.describe(), "background_killed": swept}
 
@@ -513,27 +648,103 @@ def create_app(token: str, workspace: str) -> FastAPI:
         kill_background = bool(body and body.kill_background)
         job = manager.running()
         if job is None:
-            swept = sweep_marked_processes() if kill_background else 0
+            swept = manager.sweep() if kill_background else 0
             touch_activity()
             return {"status": "idle", "job_id": None, "background_killed": swept}
         return do_cancel(job, kill_background)
 
+    # ---- persistent sessions (present only when the run was claimed for a session) ----------------------------------
+    if session is not None:
+
+        @app.post("/session/save", dependencies=[Depends(require_auth)])
+        def session_save(body: Optional[SaveRequest] = None):
+            """Save a snapshot now. Answers 200 with the summary, or 202 while a long save is still running."""
+            assert saver is not None
+            touch_activity()
+            done = saver.start("manual")
+            if not done.wait(timeout=body.wait_seconds if body else 20):
+                return JSONResponse(status_code=202, content={"status": "saving", "session": session.status()})
+            kind, value = saver.outcome or ("error", RuntimeError("save outcome missing"))
+            if kind == "ok":
+                return {"status": "saved", "snapshot": value, "session": session.status()}
+            if isinstance(value, vm_session.Busy):
+                return JSONResponse(status_code=409, content={"error": "busy", "detail": session.scrub(str(value))})
+            if isinstance(value, vm_session.Unavailable):
+                return _unavailable(value)
+            return JSONResponse(status_code=500, content={
+                "error": "save_failed", "detail": session.scrub(str(value) or type(value).__name__)[:300],
+                "note": "the previous snapshot is unchanged"})
+
+        @app.post("/session/shutdown", dependencies=[Depends(require_auth)])
+        def session_shutdown(body: Optional[ShutdownRequest] = None):
+            """Start the graceful stop (final save, then the container is removed). Asynchronous: poll /status."""
+            touch_activity()
+            try:
+                started = session.shutdown(force=bool(body and body.force))
+            except vm_session.Busy as err:
+                job = manager.running()
+                return JSONResponse(status_code=409, content={
+                    "error": "busy", "job_id": job.id if job else None, "detail": session.scrub(str(err))})
+            return {"started": started, "session": session.status()}
+
     return app
 
 
+def build_session(bundle, log):
+    """Wire the real Docker / GitHub / Worker objects for a claimed session."""
+    import vm_container
+    import vm_snapshot
+
+    base = os.environ.get("VM_BASE_URL", "").strip()
+    if not base:
+        sys.exit("agent: VM_BASE_URL is required to run a persistent session")
+    chunk = int(os.environ.get("VM_SNAPSHOT_CHUNK_BYTES", vm_snapshot.DEFAULT_CHUNK_BYTES))
+    scratch = os.environ.get("VM_SNAPSHOT_SCRATCH") or None
+    if scratch:
+        Path(scratch).mkdir(parents=True, exist_ok=True)
+    worker = vm_session.WorkerApi(base, bundle.runner_token)
+    container = vm_container.SessionContainer(bundle.session_id, bundle.image, vm_container.Docker(), jobs_dir=JOBS_DIR,
+                                              log=log)
+
+    def make_store(token_provider):
+        return vm_snapshot.SnapshotStore(bundle.repo, token_provider, session=bundle.session_id, chunk_bytes=chunk,
+                                         scratch=Path(scratch) if scratch else None, log=log)
+
+    return vm_session.SessionManager(bundle, worker=worker, container=container, store=make_store, log=log)
+
+
 def main() -> None:
-    # The token arrives on stdin so it never sits in this process's environment
-    # or argv (both are visible to other processes of the same user).
-    token = sys.stdin.read().strip()
+    # The claim bundle (a bare token for a plain VM, JSON for a session) arrives on stdin so it never sits in this
+    # process's environment or argv (both are visible to other processes of the same user).
+    raw = sys.stdin.read()
+    if vm_session is None:
+        if raw.lstrip().startswith("{"):
+            # A session bundle but no session modules installed: using the JSON as the token would register a
+            # runner nobody can talk to, and silently drop persistence. Stop with a clear error instead.
+            sys.exit("agent: got a session claim bundle but vm_session.py is not installed next to the agent")
+        token, bundle = raw.strip(), None
+    else:
+        try:
+            bundle = vm_session.parse_bundle(raw)
+        except ValueError as err:
+            sys.exit(f"agent: {err}")
+        token = bundle.runner_token
     if not token:
         sys.exit("agent: no session token supplied on stdin")
     workspace = os.environ.get("GITHUB_WORKSPACE") or os.getcwd()
     touch_activity()
     import uvicorn
 
-    uvicorn.run(
-        create_app(token, workspace), host="127.0.0.1", port=8000, log_level="warning"
-    )
+    session = None
+    if bundle is not None and bundle.has_session:
+        def log(message: str) -> None:
+            print(f"[session] {message}", flush=True)
+
+        session = build_session(bundle, log)
+    app = create_app(token, workspace, session)
+    if session is not None:
+        session.start()        # after the app exists: boot may already want to kill jobs / report events
+    uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")
 
 
 if __name__ == "__main__":

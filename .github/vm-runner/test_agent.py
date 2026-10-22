@@ -5,6 +5,7 @@ Run:  pip install -r requirements-dev.txt && pytest -q
 """
 import os
 from pathlib import Path
+import signal
 import socket
 import threading
 import time
@@ -113,10 +114,16 @@ def test_stdin_is_closed(server):
 
 def test_background_process_does_not_block_response(server):
     t0 = time.time()
-    r = run(server, "sleep 60 & echo started")
+    r = run(server, "sleep 60 & echo started $!")
     assert r["status"] == "finished" and "started" in r["output"]
     assert time.time() - t0 < 5          # old agent would hang until timeout
-    os.system("pkill -f '[s]leep 60'")
+    # kill exactly the child this test started (a `pkill -f` pattern would also hit unrelated processes and even the
+    # tool job that runs the suite)
+    child = int(r["output"].split("started")[1].split()[0])
+    try:
+        os.kill(child, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 def test_health_responds_while_job_runs_and_second_job_is_rejected(server):
@@ -137,12 +144,19 @@ def test_health_responds_while_job_runs_and_second_job_is_rejected(server):
     poller.join()
 
 
-def test_timeout_kills_whole_process_group(server):
+def test_timeout_kills_whole_process_group(server, tmp_path):
     wait_idle(server)
-    r = run(server, "sleep 300 & sleep 300; echo never", timeout_seconds=1)
+    pidfile = tmp_path / "bg.pid"
+    r = run(server, f"sleep 300 & echo $! > {pidfile}; sleep 300; echo never", timeout_seconds=1)
     assert r["status"] == "timed_out" and r["exit_code"] == 124
     time.sleep(0.5)
-    assert os.system("pgrep -f '[s]leep 300' >/dev/null") != 0   # children are gone too
+    child = int(pidfile.read_text())
+    try:
+        os.kill(child, 0)
+        alive = True
+    except ProcessLookupError:
+        alive = False
+    assert not alive, "the background child must be gone too (whole process group killed)"
 
 
 def test_running_job_reports_partial_output_then_finishes(server):
@@ -288,6 +302,25 @@ def test_escaped_background_process_survives_cancel_but_not_kill_background(serv
     r = _post_cancel(server, {"kill_background": True}).json()
     assert r["status"] == "idle" and r["background_killed"] >= 1
     assert not _alive("sleep 4242", wait_gone=5)
+
+
+def test_kill_background_spares_marked_processes_outside_this_test_run(server):
+    """On an agent-run VM the shell that runs the suite carries VM_AGENT_JOB too. kill_background must stay inside
+    the scope the tests set (VM_AGENT_SWEEP_SCOPE), or the suite kills the job running it (exit 137)."""
+    import subprocess
+    wait_idle(server)
+    env = {k: v for k, v in os.environ.items() if k != "VM_AGENT_SWEEP_SCOPE"}
+    env["VM_AGENT_JOB"] = "decoy"
+    decoy = subprocess.Popen(["sleep", "4343"], env=env)
+    try:
+        time.sleep(0.3)
+        r = _post_cancel(server, {"kill_background": True}).json()
+        assert r["status"] == "idle"
+        time.sleep(0.5)
+        assert decoy.poll() is None, "kill_background killed a marked process that is not part of this test run"
+    finally:
+        if decoy.poll() is None:
+            decoy.kill()
 
 
 def test_job_marker_is_in_job_environment_but_not_inherited_from_the_agent(server):
@@ -442,7 +475,7 @@ def test_relay_endpoint_requires_auth_and_validates_mode(server):
 def test_relay_endpoint_runs_only_installed_script_and_removes_token_file(server, tmp_path, monkeypatch):
     """The Relay API invokes the pinned script path and never passes the token in argv/output."""
     script = tmp_path / "relay.sh"
-    script.write_text("#!/usr/bin/env bash\nprintf 'mode=%s repo=%s path=%s\\n' \"$1\" \"$2\" \"$3\"\n"
+    script.write_text("#!/usr/bin/env bash\nprintf 'mode=%s repo=%s path=%s\\n' \"$1\" \"$2\" \"$3\"\n" 
                      "test -r \"$RELAY_TOKEN_FILE\"\n"
                      "stat -c '%a' \"$RELAY_TOKEN_FILE\"\n")
     script.chmod(0o755)

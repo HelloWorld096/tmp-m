@@ -12,6 +12,13 @@
 # safe: a running job touches the activity file every ~10 s, so a slow /health caused by a CPU-bound
 # build can never get a live build killed.
 #
+# Persistent sessions: when the agent has attached a session (it creates vm-session-active), idle or the lifetime
+# limit no longer end the run at once. keepalive writes vm-stopping, which makes the agent do a final verified save,
+# and waits up to VM_SAVE_WAIT_SECONDS for the agent's vm-saved flag. The lifetime limit is moved earlier by
+# VM_SESSION_RESERVE_SECONDS so the save finishes before GitHub's hard 6 h cut-off (which cannot be waited out).
+# The agent's vm-stop-now flag (written after any shutdown, or when this runner was superseded) ends the run at
+# any time. A dead agent still ends the run immediately: nothing is left that could save.
+#
 # All knobs are environment variables so tests can run it in seconds.
 set -uo pipefail
 
@@ -26,24 +33,64 @@ HEALTH_URL="${VM_AGENT_HEALTH_URL:-http://127.0.0.1:8000/health}"
 TUNNEL_PID_FILE="${VM_TUNNEL_PID_FILE:-/tmp/tunnel.pid}"
 DEAD_CHECKS="${VM_DEAD_CHECKS:-4}"
 DEAD_STALE="${VM_DEAD_STALE_SECONDS:-120}"
+FLAGS_DIR="${VM_FLAGS_DIR:-/tmp}"                      # same directory the agent's SessionManager writes its flags to
+SAVE_WAIT="${VM_SAVE_WAIT_SECONDS:-1500}"              # 25 min for the final save
+SESSION_RESERVE="${VM_SESSION_RESERVE_SECONDS:-1800}"  # session VMs start stopping this long before MAX_RUNTIME
 
 started=$(cat "$START_FILE" 2>/dev/null || true)
 case "$started" in ''|*[!0-9]*) started=$(date +%s) ;; esac
 
+# A session VM stops earlier, to leave time for the final save. Never less than half the lifetime (misconfiguration guard).
+SESSION_LIMIT=$((MAX_RUNTIME - SESSION_RESERVE))
+if [ "$SESSION_LIMIT" -lt $((MAX_RUNTIME / 2)) ]; then SESSION_LIMIT=$((MAX_RUNTIME / 2)); fi
+
 dead=0
+stopping_since=0
 while true; do
   now=$(date +%s)
+  # The agent finished (or gave up) and asks the run to end.
+  if [ -e "$FLAGS_DIR/vm-stop-now" ]; then
+    echo "The agent asked the run to end ($(cat "$FLAGS_DIR/vm-stop-now" 2>/dev/null | head -c 40))."
+    exit 0
+  fi
+  session=0
+  if [ -e "$FLAGS_DIR/vm-session-active" ]; then session=1; fi
+  # Hard limit: always, even mid-job and even while a final save is running (GitHub would cut the job anyway).
   if [ $((now - started)) -ge "$MAX_RUNTIME" ]; then
     echo "Maximum VM lifetime reached."
     exit 0
   fi
-  # mtime, not contents: a half-written file can never crash this loop.
+  if [ "$stopping_since" -gt 0 ]; then
+    if [ -e "$FLAGS_DIR/vm-saved" ]; then
+      echo "Final session save finished ($(cat "$FLAGS_DIR/vm-saved" 2>/dev/null | head -c 20))."
+      exit 0
+    fi
+    if [ $((now - stopping_since)) -ge "$SAVE_WAIT" ]; then
+      echo "The final session save did not finish within ${SAVE_WAIT}s; ending the run. The last verified snapshot stays valid."
+      exit 0
+    fi
+  else
+    reason=""
+    limit="$MAX_RUNTIME"
+    if [ "$session" = 1 ]; then limit="$SESSION_LIMIT"; fi
+    if [ $((now - started)) -ge "$limit" ]; then reason="Maximum VM lifetime reached."; fi
+    # mtime, not contents: a half-written file can never crash this loop.
+    last=$(stat -c %Y "$ACTIVITY_FILE" 2>/dev/null || echo "$now")
+    age=$((now - last))
+    if [ -z "$reason" ] && [ "$age" -ge "$IDLE_LIMIT" ]; then reason="Idle timeout reached."; fi
+    if [ -n "$reason" ]; then
+      if [ "$session" = 1 ]; then
+        echo "$reason Asking the session to save before the run ends."
+        printf '%s' "$reason" > "$FLAGS_DIR/vm-stopping" || { echo "Could not write the stop flag; ending the run."; exit 0; }
+        stopping_since=$now
+      else
+        echo "$reason"
+        exit 0
+      fi
+    fi
+  fi
   last=$(stat -c %Y "$ACTIVITY_FILE" 2>/dev/null || echo "$now")
   age=$((now - last))
-  if [ "$age" -ge "$IDLE_LIMIT" ]; then
-    echo "Idle timeout reached."
-    exit 0
-  fi
 
   healthy=1
   curl -fsS --max-time 5 "$HEALTH_URL" >/dev/null 2>&1 || healthy=0

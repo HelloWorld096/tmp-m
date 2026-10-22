@@ -9,13 +9,12 @@ on:
 
 permissions:
   contents: read
+  actions: read   # only for the "second VM" guard below: list this workflow's runs
 
-# One VM at a time. cancel-in-progress stays false on purpose: the Worker can dispatch while a build is
-# still running if /health was merely slow, and cancelling would kill that build. A VM whose agent or
-# tunnel has died ends its own run instead (see vm-runner/keepalive.sh), which releases this group.
-concurrency:
-  group: temporary-remote-vm
-  cancel-in-progress: false
+# One VM at a time, and NOTHING is ever queued. There is deliberately no `concurrency:` group, because a
+# group parks every extra run as a pending one. Instead the first step below makes a duplicate run exit
+# immediately, and the Worker does not dispatch while a run is active or starting. A VM whose agent or
+# tunnel has died ends its own run (see vm-runner/keepalive.sh), which frees the slot for the next start.
 
 env:
   VM_BASE_URL: ${{ vars.VM_BASE_URL }}   # e.g. https://remote-linux-vm.<account>.workers.dev
@@ -34,6 +33,22 @@ jobs:
     # the two limits coincide and whichever fires first (usually GitHub's, by a few seconds) ends the run.
     timeout-minutes: 360
     steps:
+      # First step, before anything is claimed: a live VM's session is never touched by a rejected duplicate.
+      # The Worker already refuses to dispatch while a run is active; this covers a run started by hand and
+      # two runs that start together. The run with the lowest id wins, so they cannot both give up.
+      - name: Refuse to start a second VM
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          older=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/vm-worker.yml/runs?per_page=30" \
+            --jq "[.workflow_runs[] | select(.status != \"completed\" and .id < ${GITHUB_RUN_ID})] | length")
+          if [ "${older}" != "0" ]; then
+            echo "::error::Another run of this workflow is already queued or running. Only one VM exists at a time and nothing is queued, so this run stops."
+            exit 1
+          fi
+
       - name: Validate configuration
         shell: bash
         run: |
@@ -64,10 +79,17 @@ jobs:
           sudo dpkg -i /tmp/cloudflared.deb
           # Copy the agent out of the workspace so commands can't alter the running copy's source.
           install -m 0644 .github/vm-runner/agent.py /tmp/vm-agent.py
+          # The session modules must sit next to the agent: it imports them by name, and a session cannot work without them.
+          for m in vm_session vm_container vm_snapshot; do
+            install -m 0644 ".github/vm-runner/${m}.py" "/tmp/${m}.py"
+          done
           install -m 0755 .github/vm-runner/keepalive.sh /tmp/vm-keepalive.sh
-          # Install the approved Relay script outside the mutable checkout.
+          # Install the reviewed Relay script outside the mutable workspace. Every fresh VM gets
+          # this pinned, checksummed copy at a fixed path before the authenticated agent starts. That is integrity
+          # at install time, not a boundary against code running on the VM (the runner user has passwordless sudo).
           sudo install -d -o root -g root -m 0755 /opt/relay
           sudo install -o root -g root -m 0755 .github/vm-runner/relay.sh /opt/relay/relay.sh
+          echo "39616e17497f37f9325917b30c3c89acc0d42fdb7926627692a8286cb44a9e82  /opt/relay/relay.sh" | sha256sum --check --strict -
 
       - name: Obtain session token
         id: session
@@ -76,26 +98,53 @@ jobs:
           VM_WEBHOOK_SECRET: ${{ secrets.VM_WEBHOOK_SECRET }}
         run: |
           set -euo pipefail
+          umask 077
           # The secret goes via curl's config on stdin, not argv (argv is world-readable in /proc).
-          RESPONSE=$(printf 'header = "Authorization: Bearer %s"\n' "$VM_WEBHOOK_SECRET" \
-            | curl -fsS --connect-timeout 5 --max-time 15 -X POST -K - "${VM_BASE_URL}/runner/claim")
-          TOKEN=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' <<< "$RESPONSE")
-          if [ -z "$TOKEN" ]; then echo "Could not obtain session token."; exit 1; fi
-          echo "::add-mask::$TOKEN"
+          # The whole claim response (runner token and, for a persistent session, a short-lived token for that
+          # session's private repository) is kept in a 0600 file that only the agent reads, once, on its stdin.
+          printf 'header = "Authorization: Bearer %s"\n' "$VM_WEBHOOK_SECRET" \
+            | curl -fsS --connect-timeout 5 --max-time 15 -X POST -K - "${VM_BASE_URL}/runner/claim" > /tmp/vm-claim.json
+          # Mask every secret value BEFORE anything can print it, then expose only the runner token as a step output.
+          python3 - <<'PY' > /tmp/vm-claim.masks
+          import json
+          d = json.load(open("/tmp/vm-claim.json"))
+          vals = [d.get("token")]
+          s = d.get("session") or {}
+          vals.append(s.get("repo_token"))
+          for v in vals:
+              if isinstance(v, str) and v:
+                  print(v)
+          PY
+          if [ ! -s /tmp/vm-claim.masks ]; then echo "Could not obtain session token."; rm -f /tmp/vm-claim.json /tmp/vm-claim.masks; exit 1; fi
+          while IFS= read -r v; do echo "::add-mask::$v"; done < /tmp/vm-claim.masks
+          TOKEN=$(head -n 1 /tmp/vm-claim.masks)
+          rm -f /tmp/vm-claim.masks
           echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+          if python3 -c 'import json,sys; sys.exit(0 if json.load(open("/tmp/vm-claim.json")).get("session") else 1)'; then
+            echo "This run was claimed for a persistent session."
+          fi
 
       - name: Start command server
         shell: bash
-        env:
-          SESSION_TOKEN: ${{ steps.session.outputs.token }}
         run: |
           set -euo pipefail
-          TOKEN="$SESSION_TOKEN"
-          unset SESSION_TOKEN          # the agent must not inherit it in its environment
-          # Token is handed over on stdin; the agent also scrubs its children's environment.
-          printf '%s' "$TOKEN" | /tmp/vm-venv/bin/python /tmp/vm-agent.py > /tmp/agent.log 2>&1 &
+          # Scratch space for snapshot staging (chunks are built here, never in the container). Prefer the large
+          # /mnt temp disk; fall back to /tmp.
+          SCRATCH=/tmp/vm-scratch
+          if [ -d /mnt ] && sudo mkdir -p /mnt/vm-scratch 2>/dev/null; then
+            sudo chown "$(id -u):$(id -g)" /mnt/vm-scratch
+            SCRATCH=/mnt/vm-scratch
+          else
+            mkdir -p "$SCRATCH"
+          fi
+          chmod 700 "$SCRATCH"
+          export VM_SNAPSHOT_SCRATCH="$SCRATCH"
+          # The claim bundle is handed over on stdin (the agent also scrubs its children's environment). The file is
+          # unlinked right after the shell has opened it: the agent keeps reading through its descriptor, and no
+          # later command on this VM can find the repository token on disk.
+          /tmp/vm-venv/bin/python /tmp/vm-agent.py < /tmp/vm-claim.json > /tmp/agent.log 2>&1 &
           echo $! > /tmp/agent.pid
-          unset TOKEN
+          rm -f /tmp/vm-claim.json
           for i in $(seq 1 20); do
             if curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1; then echo "Command server is ready."; exit 0; fi
             sleep 1
