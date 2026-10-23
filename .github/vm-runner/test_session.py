@@ -432,63 +432,56 @@ def test_runner_token_is_sent_to_the_worker_only(gh, mw, env, tmp_path):
 
 
 # --------------------------------------------------------------------------- autosave
-def test_autosave_only_when_dirty_idle_and_due(gh, mw, env, tmp_path):
+def test_tick_does_not_periodically_autosave_dirty_idle_session(gh, mw, env, tmp_path):
     clock = Clock()
-    m, c, _ = manager(env, mw, tmp_path, clock=clock, autosave_idle_s=60, autosave_interval_s=600)
+    m, c, _ = manager(env, mw, tmp_path, clock=clock,
+                      autosave_idle_s=60, autosave_interval_s=600)
     boot_sync(m)
     write_file(env, c)
+    m.acquire_job()
+    m.release_job()
+
+    # Advance beyond both former autosave thresholds.
     clock.t += 3000
     m.tick()
-    assert m.last_save is None, "not dirty: nothing to save"
-    m.acquire_job()
-    m.release_job()
-    clock.t += 10
-    m.tick()
-    assert m.last_save is None, "not idle long enough"
-    clock.t += 100
-    m.tick()
-    assert m.last_save and m.last_save["seq"] == 1
-    m.acquire_job()
-    m.release_job()
-    clock.t += 200
-    m.tick()
-    assert m.last_save["seq"] == 1, "interval since the last save not reached"
-    clock.t += 700
-    m.tick()
-    assert m.last_save["seq"] == 2
 
-
-def test_autosave_skips_while_a_job_runs(gh, mw, env, tmp_path):
-    clock = Clock()
-    m, c, _ = manager(env, mw, tmp_path, clock=clock)
-    boot_sync(m)
-    m.acquire_job()
-    clock.t += 5000
-    m.tick()
     assert m.last_save is None
+    assert mw.types().count("commit") == 0
+    assert m.state == "ready"
 
 
-def test_failed_autosave_is_retried_only_after_the_interval(gh, mw, env, tmp_path):
+def test_tick_does_not_autosave_while_a_job_runs(gh, mw, env, tmp_path):
     clock = Clock()
     m, c, _ = manager(env, mw, tmp_path, clock=clock)
     boot_sync(m)
     write_file(env, c)
-    m.acquire_job(); m.release_job()
-    mw.commit_status = 500
+    m.acquire_job()
     clock.t += 5000
     m.tick()
-    n = mw.types().count("commit")
-    assert n >= 1 and m.state == "ready"
-    clock.t += 10
+
+    assert m.last_save is None
+    assert mw.types().count("commit") == 0
+
+
+def test_tick_does_not_attempt_periodic_autosave(gh, mw, env, tmp_path):
+    clock = Clock()
+    m, c, _ = manager(env, mw, tmp_path, clock=clock)
+    boot_sync(m)
+    write_file(env, c)
+    m.acquire_job()
+    m.release_job()
+    mw.commit_status = 500
+
+    clock.t += 5000
     m.tick()
-    assert mw.types().count("commit") == n, "no retry storm"
-    mw.commit_status = 200
     clock.t += 700
     m.tick()
-    assert m.last_save and m.last_save["seq"] == 1
+
+    assert mw.types().count("commit") == 0
+    assert m.last_save is None
+    assert m.state == "ready"
 
 
-# --------------------------------------------------------------------------- shutdown
 def test_shutdown_saves_then_stops(gh, mw, env, tmp_path):
     m, c, flags = manager(env, mw, tmp_path)
     boot_sync(m)

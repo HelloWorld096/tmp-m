@@ -531,11 +531,9 @@ class SessionManager:
                 pass
             return
         now = self.clock()
-        with self._cv:
-            due = (self.state == "ready" and not self.capturing and self._dirty and not self._active_jobs
-                   and now - self._last_activity >= self.autosave_idle_s
-                   and now - self._last_save_at >= self.autosave_interval_s
-                   and now - self._last_attempt >= self.autosave_interval_s)
+        # Deliberately disable periodic idle autosaves. Snapshots are made
+        # only on explicit save requests or during graceful session shutdown.
+        due = False
         if due:
             try:
                 self.save("autosave")
