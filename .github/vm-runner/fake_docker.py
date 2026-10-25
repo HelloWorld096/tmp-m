@@ -96,7 +96,45 @@ def cmd_export(name):
                 tf.addfile(ti)
 
 
+def cmd_inspect(name):
+    c = cdir(name)
+    if not c.exists():
+        die(f"Error: No such object: {name}")
+    custom = c / "inspect.json"
+    info = json.loads(custom.read_text()) if custom.exists() else {}
+    info.setdefault("Image", "sha256:fakeimage")
+    info.setdefault("Config", {"Image": "fake", "Env": ["PATH=/usr/bin"], "User": ""})
+    info.setdefault("Mounts", [])
+    print(json.dumps([info]))
+
+
 def cmd_cp(args):
+    # tar stream out of a directory:  docker cp NAME:/dir/. -
+    if len(args) == 2 and args[1] == "-" and ":" in args[0]:
+        n, _, p = args[0].partition(":")
+        src = cdir(n) / "rootfs" / p.removesuffix("/.").lstrip("/")
+        if not src.is_dir():
+            die(f"Error response from daemon: Could not find the file {p} in container {n}")
+        with tarfile.open(fileobj=sys.stdout.buffer, mode="w|", format=tarfile.PAX_FORMAT) as tf:
+            for q, path in sorted(walk(src).items()):
+                ti = tf.gettarinfo(str(path), arcname=q.lstrip("/"))
+                if ti.isreg():
+                    with open(path, "rb") as fh:
+                        tf.addfile(ti, fh)
+                else:
+                    tf.addfile(ti)
+        return
+    # tar stream into a directory:  docker cp - NAME:/dir/
+    if args[0] == "-" and len(args) == 2:
+        n, _, p = args[1].partition(":")
+        root = cdir(n) / "rootfs"
+        if not root.exists():
+            die(f"Error response from daemon: No such container: {n}")
+        dest = root / p.lstrip("/")
+        dest.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as tf:
+            tf.extractall(dest, filter="fully_trusted")
+        return
     # docker cp -a - NAME:/   (tar stream)   |   docker cp SRC NAME:PATH   |   docker cp NAME:PATH DEST
     if args[0] != "-a" and ":" in (args[0] + args[1]):
         src, dest = args[0], args[1]
@@ -214,6 +252,8 @@ def main(argv):
         cmd_export(args[0])
     elif cmd == "cp":
         cmd_cp(args)
+    elif cmd == "inspect":
+        cmd_inspect(args[-1])
     elif cmd == "pause":
         (cdir(args[0]) / "paused").touch()
     elif cmd == "unpause":

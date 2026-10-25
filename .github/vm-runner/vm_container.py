@@ -21,11 +21,19 @@ import threading
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
+import vm_deep
 from vm_snapshot import ChunkReader, ChunkWriter, StoreError
 
 DEFAULT_IMAGE = "ubuntu:24.04"
 DEFAULT_WORKDIR = "/workspace"
 META_MEMBER = ".vm-snapshot/deleted.json"
+# Host-supplied side data stored in a snapshot (command history, deep-mode manifest). Everything under RESERVED_NAME
+# belongs to the agent: a file the container itself creates under that name is NEVER stored (it could otherwise forge
+# the history or the deletion list), and extras are never copied back into the container on restore.
+RESERVED_NAME = ".vm-snapshot"
+EXTRA_PREFIX = ".vm-snapshot/extra/"
+MAX_EXTRA_BYTES = 128 * 1024 * 1024
+EXTRA_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
 # docker image reference: [registry[:port]/]path[:tag][@sha256:digest]. Strict on purpose: the value ends up in argv.
 IMAGE_RE = re.compile(
@@ -164,9 +172,11 @@ class SessionContainer:
         self.docker.run("exec", self.name, "sh", "-c", SWEEP_SCRIPT, "sweep", marker, sig, check=False, timeout=60)
 
     # ---- snapshot: capture ------------------------------------------------
-    def capture(self, sink: ChunkWriter) -> dict:
+    def capture(self, sink: ChunkWriter, extras: Optional[Callable[[], dict]] = None) -> dict:
         """Write the container's changes into `sink` as tar+gzip. The container is paused for the duration, so the
-        copy is crash-consistent; it is always resumed, whatever happens."""
+        copy is crash-consistent; it is always resumed, whatever happens.
+
+        ``extras`` is called while the container is paused and returns {name: bytes} side data (see EXTRA_PREFIX)."""
         with self._lock:
             self.docker.run("pause", self.name, check=False)
             try:
@@ -175,7 +185,7 @@ class SessionContainer:
                 exp = self.docker.popen("export", self.name, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
                 assert exp.stdout is not None
                 try:
-                    kept = self._filter_export(exp.stdout, sink, changed, deleted)
+                    kept = self._filter_export(exp.stdout, sink, changed, deleted, extras() if extras else None)
                 except BaseException:
                     sink.abort()
                     exp.kill()
@@ -190,15 +200,25 @@ class SessionContainer:
                 self.docker.run("unpause", self.name, check=False)
 
     @staticmethod
-    def _filter_export(stream, sink: ChunkWriter, changed: set, deleted: list) -> dict:
+    def _filter_export(stream, sink: ChunkWriter, changed: set, deleted: list, extras: Optional[dict] = None) -> dict:
         src = tarfile.open(fileobj=stream, mode="r|")
         dst = tarfile.open(fileobj=sink, mode="w|gz", compresslevel=1, format=tarfile.PAX_FORMAT)
         n = 0
         for m in src:
             if "/" + m.name.strip("/") not in changed:
                 continue
+            top = m.name.strip("/").split("/", 1)[0]
+            if top == RESERVED_NAME:
+                continue            # the container must not be able to write the agent's own members
             dst.addfile(m, src.extractfile(m) if m.isreg() else None)
             n += 1
+        for name, data in sorted((extras or {}).items()):
+            if not EXTRA_NAME_RE.match(name) or len(data) > MAX_EXTRA_BYTES:
+                raise DockerError(f"invalid snapshot side data {name!r}")
+            ei = tarfile.TarInfo(EXTRA_PREFIX + name)
+            ei.size = len(data)
+            ei.mtime = 0
+            dst.addfile(ei, io.BytesIO(data))
         meta = json.dumps({"deleted": deleted}, sort_keys=True).encode()
         ti = tarfile.TarInfo(META_MEMBER)
         ti.size = len(meta)
@@ -215,10 +235,19 @@ class SessionContainer:
         cp = self.docker.popen("cp", "-a", "-", f"{self.name}:/", stdin=subprocess.PIPE, stderr=subprocess.PIPE)
         assert cp.stdin is not None
         deleted: list = []
+        extras: dict = {}
         n = 0
         try:
             dst = tarfile.open(fileobj=cp.stdin, mode="w|", format=tarfile.PAX_FORMAT)
             for m in src:
+                if m.name.startswith(EXTRA_PREFIX):
+                    name = m.name[len(EXTRA_PREFIX):]
+                    f = src.extractfile(m) if m.isreg() else None
+                    if f is not None and EXTRA_NAME_RE.match(name) and m.size <= MAX_EXTRA_BYTES:
+                        extras[name] = f.read()
+                    continue                # never copied into the container
+                if m.name.strip("/").split("/", 1)[0] == RESERVED_NAME and m.name != META_MEMBER:
+                    continue
                 if m.name == META_MEMBER:
                     f = src.extractfile(m)
                     data = json.loads(f.read().decode("utf-8")) if f else {}
@@ -240,7 +269,78 @@ class SessionContainer:
             raise DockerError(f"docker cp failed: {err[-300:]}")
         for i in range(0, len(deleted), 50):
             self.docker.run("exec", self.name, "rm", "-rf", "--", *deleted[i:i + 50], timeout=120)
-        return {"entries": n, "deleted": len(deleted)}
+        return {"entries": n, "deleted": len(deleted), "extras": extras}
+
+    # ---- deep snapshots (see vm_deep) -----------------------------------------------------------------------------
+    def inspect(self) -> dict:
+        out = self.docker.run("inspect", self.name, check=False, timeout=60)
+        try:
+            data = json.loads((out.stdout or b"[]").decode("utf-8", "replace"))
+            return data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else {}
+        except ValueError:
+            return {}
+
+    def exec_text(self, script: str, timeout: float = vm_deep.MANIFEST_TIMEOUT_S) -> str:
+        p = self.docker.run("exec", self.name, "sh", "-c", script, check=False, timeout=timeout)
+        return (p.stdout or b"").decode("utf-8", "replace")
+
+    def _read_dir_tar(self, dest: str, limit: int) -> Optional[bytes]:
+        """The contents of a directory as a tar stream, or None when it is bigger than `limit` or cannot be read."""
+        proc = self.docker.popen("cp", f"{self.name}:{dest}/.", "-", stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        assert proc.stdout is not None
+        try:
+            data = proc.stdout.read(limit + 1)
+            if len(data) > limit:
+                proc.kill()
+                return None
+        finally:
+            proc.stdout.close()
+            rc = proc.wait()
+        return data if rc == 0 else None
+
+    def collect_deep(self) -> dict:
+        """Side data for a deep snapshot: {"deep.json": bytes, "volume-N.tar": bytes...}. The container must be running
+        (docker exec is refused on a paused one), so this happens BEFORE capture() pauses it; the session manager keeps
+        jobs out meanwhile. Best effort per part: a manifest or volume that cannot be read is recorded, not fatal."""
+        info = self.inspect()
+        try:
+            manifest_text = self.exec_text(vm_deep.MANIFEST_SCRIPT)
+        except DockerError as err:
+            self.log(f"deep: package manifests unavailable: {err}")
+            manifest_text = ""
+        extras: dict = {}
+        volumes, skipped = [], []
+        for i, dest in enumerate(vm_deep.volume_dests(info)):
+            data = self._read_dir_tar(dest, vm_deep.MAX_VOLUME_BYTES)
+            if data is None:
+                skipped.append({"dest": dest, "reason": f"unreadable or larger than {vm_deep.MAX_VOLUME_BYTES // 1024 // 1024} MB"})
+                continue
+            name = f"volume-{i}.tar"
+            extras[name] = data
+            volumes.append({"dest": dest, "extra": name, "bytes": len(data)})
+        deep = vm_deep.build(info, manifest_text, workdir=self.workdir, volumes=volumes, skipped=skipped)
+        extras["deep.json"] = json.dumps(deep, sort_keys=True, indent=1).encode()
+        return extras
+
+    def apply_deep(self, extras: dict) -> dict:
+        """Restore the volume directories of a deep snapshot, then compare the package manifests with the restored
+        container. Returns {"volumes": n, "report": vm_deep.compare(...), "summary": str}. Never reinstalls anything."""
+        raw = extras.get("deep.json")
+        if raw is None:
+            return {"volumes": 0, "report": None, "summary": "this snapshot has no deep data"}
+        deep = vm_deep.parse(raw)
+        restored = 0
+        for v in deep["volumes"]:
+            data = extras.get(v["extra"])
+            if data is None:
+                continue
+            self.docker.run("exec", self.name, "mkdir", "-p", v["dest"], check=False, timeout=60)
+            self.docker.run("cp", "-", f"{self.name}:{v['dest']}/", input=data, timeout=600)
+            restored += 1
+        now = vm_deep.parse_manifests(self.exec_text(vm_deep.MANIFEST_SCRIPT))
+        report = vm_deep.compare(deep["manifests"], now)
+        return {"volumes": restored, "report": report, "summary": vm_deep.summarize(report),
+                "volumes_skipped": deep.get("volumes_skipped", [])}
 
     def ensure_workdir(self, path: str) -> str:
         """The directory a restored session should resume in, or the default if it no longer exists."""

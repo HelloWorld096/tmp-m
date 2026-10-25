@@ -79,8 +79,9 @@ jobs:
           sudo dpkg -i /tmp/cloudflared.deb
           # Copy the agent out of the workspace so commands can't alter the running copy's source.
           install -m 0644 .github/vm-runner/agent.py /tmp/vm-agent.py
-          # The session modules must sit next to the agent: it imports them by name, and a session cannot work without them.
-          for m in vm_session vm_container vm_snapshot; do
+          # The runner modules must sit next to the agent: it imports them by name (vm_history is imported unconditionally, the
+          # others by the session code), so a missing file stops the agent at start. test_workflow_files.py checks this list.
+          for m in vm_session vm_container vm_snapshot vm_history vm_deep; do
             install -m 0644 ".github/vm-runner/${m}.py" "/tmp/${m}.py"
           done
           install -m 0755 .github/vm-runner/keepalive.sh /tmp/vm-keepalive.sh

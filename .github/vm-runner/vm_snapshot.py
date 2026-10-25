@@ -375,6 +375,25 @@ class Restored:
 Fence = Callable[[str, dict], None]
 
 
+@dataclass
+class Pending:
+    """A snapshot that exists only in local scratch space (captured, not yet uploaded)."""
+    work: Path
+    writer: "ChunkWriter"
+    seq: int
+    epoch: int
+    previous_seq: int
+    retained: int
+    config: dict
+
+    @property
+    def total(self) -> int:
+        return self.writer.total
+
+    def discard(self) -> None:
+        shutil.rmtree(self.work, ignore_errors=True)
+
+
 class SnapshotStore:
     def __init__(self, repo: str, token_provider: Callable[[], str], *, session: str,
                  cap_bytes: int = DEFAULT_CAP_BYTES, cap_includes_previous: bool = True,
@@ -543,7 +562,17 @@ class SnapshotStore:
     # ---- save -------------------------------------------------------------
     def save(self, *, epoch: int, capture: Callable[[ChunkWriter], None], config: dict, fence: Fence,
              progress: Callable[[str], None] = lambda m: None) -> dict:
-        """Capture -> upload -> verify -> commit -> collect garbage. Any failure leaves the previous snapshot intact."""
+        """Capture -> upload -> verify -> commit -> collect garbage. Any failure leaves the previous snapshot intact.
+
+        Synchronous convenience: the session manager uses capture_local() and upload() separately so the container is
+        only held still for the capture, while the (slow) upload runs in the background."""
+        pending = self.capture_local(epoch=epoch, capture=capture, config=config, progress=progress)
+        return self.upload(pending, fence=fence, progress=progress)
+
+    def capture_local(self, *, epoch: int, capture: Callable[[ChunkWriter], None], config: dict,
+                      progress: Callable[[str], None] = lambda m: None) -> "Pending":
+        """Phase 1: write the snapshot to local scratch space. Nothing is uploaded and nothing is visible remotely, so a
+        failure here changes nothing. The caller owns the returned Pending and must upload() or discard() it."""
         progress("inspecting the session repository")
         rels = self.list_releases()
         seq = max([r.seq or 0 for r in rels] + [0]) + 1
@@ -556,7 +585,6 @@ class SnapshotStore:
                 "the previous snapshot is kept, nothing was changed")
         work = Path(tempfile.mkdtemp(prefix="snap-", dir=self.scratch))
         writer = ChunkWriter(work, self.chunk_bytes, max_bytes=budget, min_free=self.min_free)
-        release_id: Optional[int] = None
         try:
             progress("capturing the filesystem state")
             try:
@@ -567,7 +595,18 @@ class SnapshotStore:
                                   "Delete data in the session or start a fresh session.") from err
             finally:
                 writer.abort()
+        except BaseException:
+            shutil.rmtree(work, ignore_errors=True)
+            raise
+        return Pending(work=work, writer=writer, seq=seq, epoch=epoch, previous_seq=previous[0].seq if previous else 0,
+                       retained=retained, config=config)
 
+    def upload(self, pending: "Pending", *, fence: Fence, progress: Callable[[str], None] = lambda m: None) -> dict:
+        """Phase 2: upload, verify, commit, collect garbage. Always removes the scratch files, success or not.
+        Only a normal return means the snapshot is durable."""
+        writer, seq, epoch = pending.writer, pending.seq, pending.epoch
+        release_id: Optional[int] = None
+        try:
             progress(f"uploading {len(writer.chunks)} chunk(s), {writer.total} bytes")
             tag = f"vmsnap-{epoch}-{seq}-{secrets.token_hex(4)}"
             created = self._api("POST", f"/repos/{self.repo}/releases", {
@@ -580,8 +619,8 @@ class SnapshotStore:
                                       lambda p=ch.path: open(p, "rb"))
                 ch.path.unlink(missing_ok=True)        # verified remotely; free the scratch space
             manifest = build_manifest(session=self.session, epoch=epoch, seq=seq,
-                                      previous_seq=previous[0].seq if previous else 0,
-                                      chunk_bytes=self.chunk_bytes, writer=writer, config=config)
+                                      previous_seq=pending.previous_seq,
+                                      chunk_bytes=self.chunk_bytes, writer=writer, config=pending.config)
             mbytes = json.dumps(manifest, sort_keys=True, indent=1).encode()
             msha = hashlib.sha256(mbytes).hexdigest()
             self._verified_upload(release_id, MANIFEST_NAME, len(mbytes), msha, lambda: mbytes)
@@ -605,7 +644,7 @@ class SnapshotStore:
                     self.log(f"could not remove the unfinished upload: {err}")
             raise
         finally:
-            shutil.rmtree(work, ignore_errors=True)
+            pending.discard()
 
         summary = {"seq": seq, "epoch": epoch, "bytes": writer.total, "sha256": manifest["sha256"],
                    "chunks": len(writer.chunks), "created_at": manifest["created_at"], "release_id": committed_id}

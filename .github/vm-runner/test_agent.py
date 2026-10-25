@@ -170,14 +170,14 @@ def test_running_job_reports_partial_output_then_finishes(server):
 
 
 def test_output_is_tail_truncated(server):
-    r = run(server, "python3 - <<'EOF'\nprint('x' * 50000)\nprint('END')\nEOF")
+    r = run(server, "python3 - <<'EOF'\nprint('x' * 70000)\nprint('END')\nEOF")
     assert r["output_truncated"] is True
-    assert len(r["output"]) <= 20_000 and "END" in r["output"]
+    assert len(r["output"]) <= 60_000 and "END" in r["output"]
 
 
 def test_validation(server):
     assert httpx.post(f"{server['url']}/jobs", json={"command": "   "}, headers=H()).status_code == 400
-    assert httpx.post(f"{server['url']}/jobs", json={"command": "x" * 20_001}, headers=H()).status_code == 422
+    assert httpx.post(f"{server['url']}/jobs", json={"command": "x" * 60_001}, headers=H()).status_code == 422
     assert httpx.post(f"{server['url']}/jobs", json={"command": "true", "timeout_seconds": 99999},
                       headers=H()).status_code == 422
     assert httpx.get(f"{server['url']}/jobs/unknown", headers=H()).status_code == 404

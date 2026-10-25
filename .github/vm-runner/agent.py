@@ -47,19 +47,21 @@ from typing import Literal, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+import vm_history
 
 try:  # session persistence is optional: without these files the agent behaves exactly as before
     import vm_session
 except ImportError:  # pragma: no cover
     vm_session = None
 
-MAX_COMMAND_CHARS = 20_000
+MAX_COMMAND_CHARS = 60_000
 DEFAULT_JOB_SECONDS = 900
 MAX_JOB_SECONDS = 3_600
 MAX_WAIT_SECONDS = 55
-OUTPUT_TAIL_CHARS_FINISHED = 20_000
-OUTPUT_TAIL_CHARS_RUNNING = 4_000
+OUTPUT_TAIL_CHARS_FINISHED = 60_000
+OUTPUT_TAIL_CHARS_RUNNING = 20_000
 MAX_OUTPUT_BYTES = 100 * 1024 * 1024
 KEEP_JOBS = 20
 KILL_GRACE_SECONDS = 5
@@ -165,6 +167,7 @@ class Job:
         # job's own EXIT trap could not run because the process was SIGKILLed on timeout or cancel.
         self.cleanup_files: list[Path] = []
         self.in_container = False
+        self.record = False
 
     @property
     def state(self) -> str:
@@ -211,8 +214,9 @@ class Job:
 
 
 class JobManager:
-    def __init__(self, workspace: str, session=None):
+    def __init__(self, workspace: str, session=None, history=None):
         self.workspace = workspace
+        self.history = history          # vm_history.HistoryStore or None
         self.cwd = workspace
         self.session = session          # vm_session.SessionManager or None (legacy host mode)
         self.lock = threading.Lock()
@@ -220,20 +224,50 @@ class JobManager:
         self.jobs: "OrderedDict[str, Job]" = OrderedDict()
         self.by_request: dict[str, Job] = {}
         JOBS_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if self.history is not None:
+            self.history.interrupt_running()    # nothing of a previous agent process is running any more
 
     # -- lifecycle ---------------------------------------------------------
     def submit(self, command: str, timeout: int, request_id: Optional[str] = None, cleanup_files: Optional[list[Path]] = None,
-               on_host: bool = False) -> tuple[Job, bool]:
+               on_host: bool = False, record: bool = False, replay_of: Optional[str] = None) -> tuple[Job, bool]:
         """Start a job. Returns (job, duplicate); duplicate=True means request_id was already seen.
 
         With a session attached the command runs inside the session container, except ``on_host`` jobs (the relay
         transfer scripts, which need relay.sh and docker). May raise ``vm_session.Unavailable`` (-> HTTP 503).
+
+        ``record=True`` (user commands only, never relay jobs) writes every attempt to the history database, including
+        refusals (busy, restoring, ...), which get their own id so they can be replayed later.
         """
+        try:
+            return self._submit(command, timeout, request_id, cleanup_files, on_host, record, replay_of)
+        except Busy:
+            self._note_rejected(record, command, timeout, request_id, replay_of, "busy")
+            raise
+        except Exception as err:
+            if vm_session is not None and isinstance(err, vm_session.Unavailable):
+                self._note_rejected(record, command, timeout, request_id, replay_of, err.reason)
+            raise
+
+    def _note_rejected(self, record, command, timeout, request_id, replay_of, reason) -> None:
+        if record and self.history is not None:
+            try:
+                self.history.record_attempt(uuid.uuid4().hex[:16], command, timeout, request_id,
+                                            kind="replay" if replay_of else "run", replay_of=replay_of, rejected=reason)
+            except Exception:  # noqa: BLE001 - the history must never make a refusal fail differently
+                pass
+
+    def _submit(self, command, timeout, request_id, cleanup_files, on_host, record, replay_of):
         with self.lock:
             # Replay check comes first: a retry of a submission that already started must get its own
             # job back, not "busy" (the job it started is what is keeping the agent busy).
             if request_id is not None and request_id in self.by_request:
                 return self.by_request[request_id], True
+            if self.session is not None and getattr(self.session, "handoff", False):
+                # While a handoff drains the running job, new commands must hear "handoff" (the Worker queues them for
+                # the replacement VM), not "busy" (which would mean: retry here shortly).
+                refused = self.session.gate()
+                if refused is not None:
+                    raise refused
             if self.current is not None and not self.current.done.is_set():
                 raise Busy(self.current.id)
             if self.session is not None:
@@ -279,6 +313,13 @@ class JobManager:
                 out.close()
             self.current = job
             self.jobs[job.id] = job
+            job.record = bool(record and self.history is not None)
+            if job.record:
+                try:
+                    self.history.record_attempt(job.id, command, timeout, request_id,
+                                                kind="replay" if replay_of else "run", replay_of=replay_of)
+                except Exception:  # noqa: BLE001
+                    job.record = False
             if request_id is not None:
                 self.by_request[request_id] = job
             self._prune()
@@ -428,12 +469,32 @@ class JobManager:
         if self.session is not None:
             self.session.release_job(job.cwd if job.in_container else None)
         touch_activity()
+        # After the slot is released: the database write must never delay the next command or the workdir update.
+        if job.record and self.history is not None:
+            try:
+                tail, _ = job.read_output(2_000)
+                self.history.finish(job.id, job.state, job.exit_code, job.cwd, tail)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+REPLAY_ID_RE = r"^(?:[0-9a-f]{16}|q-[0-9a-f]{16})$"
 
 
 class JobRequest(BaseModel):
-    command: str = Field(min_length=1, max_length=MAX_COMMAND_CHARS)
+    # Either a command, or replay_of (the id of an earlier attempt in the history: the agent looks the command up).
+    # With both, the command is what the caller (the Worker, for a command it queued while the VM was busy) supplied,
+    # and replay_of only records where it came from.
+    command: Optional[str] = Field(default=None, min_length=1, max_length=MAX_COMMAND_CHARS)
+    replay_of: Optional[str] = Field(default=None, pattern=REPLAY_ID_RE)
     timeout_seconds: Optional[int] = Field(default=None, ge=1, le=MAX_JOB_SECONDS)
     request_id: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+
+    @model_validator(mode="after")
+    def _need_command_or_replay(self):
+        if self.command is None and self.replay_of is None:
+            raise ValueError("either command or replay_of is required")
+        return self
 
 
 class RelayJobRequest(BaseModel):
@@ -460,6 +521,7 @@ class CancelRequest(BaseModel):
 
 class SaveRequest(BaseModel):
     wait_seconds: float = Field(default=20, ge=0, le=50)
+    deep: bool = False          # also record package manifests, image VOLUME data and runtime config (vm_deep)
 
 
 class ShutdownRequest(BaseModel):
@@ -477,17 +539,21 @@ class SaveRunner:
         self._lock = threading.Lock()
         self._done: Optional[threading.Event] = None
         self._outcome: Optional[tuple] = None
+        self.deep = False
 
-    def start(self, reason: str) -> threading.Event:
+    def start(self, reason: str, deep: bool = False) -> threading.Event:
         with self._lock:
             if self._done is not None and not self._done.is_set():
                 return self._done           # already running: join it
             done = threading.Event()
             self._done, self._outcome = done, None
+            self.deep = deep
 
             def run() -> None:
                 try:
-                    self._outcome = ("ok", self.session.save(reason))
+                    # background=True: this thread ends when the container is released again; the upload goes on in
+                    # its own thread and only counts as saved once committed (session.status().durable_seq).
+                    self._outcome = ("ok", self.session.save(reason, background=True, deep=self.deep))
                 except BaseException as err:  # noqa: BLE001 - reported to the caller, never raised in the thread
                     self._outcome = ("error", err)
                 finally:
@@ -505,12 +571,14 @@ def _unavailable(err) -> JSONResponse:
     return JSONResponse(status_code=503, content={"error": err.reason, "detail": err.detail})
 
 
-def create_app(token: str, workspace: str, session=None) -> FastAPI:
+def create_app(token: str, workspace: str, session=None, history=None) -> FastAPI:
     """``session`` is a ``vm_session.SessionManager`` (persistent-session mode) or None (the original behaviour)."""
     if not token:
         raise ValueError("session token must not be empty")
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-    manager = JobManager(workspace, session)
+    if history is None:
+        history = vm_history.HistoryStore()
+    manager = JobManager(workspace, session, history)
     saver = SaveRunner(session) if session is not None else None
 
     def kill_jobs() -> None:
@@ -522,6 +590,7 @@ def create_app(token: str, workspace: str, session=None) -> FastAPI:
 
     if session is not None:
         session.set_kill_jobs(kill_jobs)
+        session.set_history(history)
 
     def is_authorized(request: Request) -> bool:
         supplied = request.headers.get("Authorization", "")
@@ -556,11 +625,22 @@ def create_app(token: str, workspace: str, session=None) -> FastAPI:
 
     @app.post("/jobs", dependencies=[Depends(require_auth)])
     def submit(req: JobRequest, request: Request):
-        if not req.command.strip():
+        command, timeout = req.command, req.timeout_seconds
+        if command is None:
+            if req.replay_of is None:
+                raise HTTPException(status_code=400, detail="Missing command")
+            old = history.get(req.replay_of)
+            if old is None:
+                raise HTTPException(status_code=404, detail="unknown job id: nothing to replay")
+            command = old["command"]
+            timeout = timeout or old["timeout_seconds"]
+        if not command.strip():
             raise HTTPException(status_code=400, detail="Missing command")
+        if len(command) > MAX_COMMAND_CHARS:
+            raise HTTPException(status_code=400, detail="command too long")
         try:
             job, duplicate = manager.submit(
-                req.command, req.timeout_seconds or DEFAULT_JOB_SECONDS, req.request_id
+                command, timeout or DEFAULT_JOB_SECONDS, req.request_id, record=True, replay_of=req.replay_of
             )
         except Busy as busy:
             return JSONResponse(
@@ -568,7 +648,27 @@ def create_app(token: str, workspace: str, session=None) -> FastAPI:
             )
         except vm_session.Unavailable as err:
             return _unavailable(err)
-        return {"job_id": job.id, "status": job.state, "duplicate": duplicate}
+        return {"job_id": job.id, "status": job.state, "duplicate": duplicate, "replay_of": req.replay_of}
+
+    @app.get("/history", dependencies=[Depends(require_auth)])
+    def get_history(limit: int = 10):
+        """The latest attempts (newest first), including refused ones. Commands are shortened here; see /history/{id}."""
+        rows = history.recent(limit)
+        out = []
+        for r in rows:
+            v = vm_history.public_view(r, with_command=False)
+            cmd = r["command"]
+            v["command"] = cmd if len(cmd) <= 300 else cmd[:300] + "..."
+            v["command_chars"] = len(cmd)
+            out.append(v)
+        return {"jobs": out, "total": history.count()}
+
+    @app.get("/history/{job_id}", dependencies=[Depends(require_auth)])
+    def get_history_item(job_id: str):
+        row = history.get(job_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="unknown job id")
+        return {**vm_history.public_view(row), "output_tail": row["output_tail"]}
 
     @app.post("/relay/jobs", dependencies=[Depends(require_auth)])
     def submit_relay(req: RelayJobRequest, request: Request):
@@ -661,12 +761,23 @@ def create_app(token: str, workspace: str, session=None) -> FastAPI:
             """Save a snapshot now. Answers 200 with the summary, or 202 while a long save is still running."""
             assert saver is not None
             touch_activity()
-            done = saver.start("manual")
-            if not done.wait(timeout=body.wait_seconds if body else 20):
+            wait = body.wait_seconds if body else 20
+            began = time.time()
+            done = saver.start("manual", deep=bool(body and body.deep))
+            if not done.wait(timeout=wait):
                 return JSONResponse(status_code=202, content={"status": "saving", "session": session.status()})
             kind, value = saver.outcome or ("error", RuntimeError("save outcome missing"))
             if kind == "ok":
-                return {"status": "saved", "snapshot": value, "session": session.status()}
+                # Captured. Give the upload the rest of the caller's patience; only a committed snapshot is "saved".
+                session.wait_upload(max(0.0, wait - (time.time() - began)))
+                st = session.status()
+                if st["uploading"]:
+                    return JSONResponse(status_code=202, content={"status": "uploading", "snapshot": value, "session": st})
+                if st["upload_error"]:
+                    return JSONResponse(status_code=500, content={
+                        "error": "save_failed", "detail": session.scrub(st["upload_error"])[:300],
+                        "note": "the previous snapshot is unchanged; the session still has unsaved changes"})
+                return {"status": "saved", "snapshot": {**value, **(st["last_save"] or {})}, "session": st}
             if isinstance(value, vm_session.Busy):
                 return JSONResponse(status_code=409, content={"error": "busy", "detail": session.scrub(str(value))})
             if isinstance(value, vm_session.Unavailable):

@@ -37,6 +37,7 @@ MAX_REASON = 300
 # Flag files shared with keepalive.sh (see the testament, section D).
 FLAG_ACTIVE = "vm-session-active"     # written at boot when a session is attached
 FLAG_STOPPING = "vm-stopping"          # keepalive asks for a final save
+FLAG_HANDOFF = "vm-handoff"            # keepalive asks for a handoff: drain, deep save, the Worker starts a replacement
 FLAG_SAVED = "vm-saved"                # the agent finished its final save attempt ("ok" or "failed")
 FLAG_STOP_NOW = "vm-stop-now"          # the agent asks the run to end
 
@@ -74,6 +75,7 @@ class Bundle:
     repo_token: str = ""
     repo_token_expires_at: float = 0.0       # epoch seconds
     fresh: bool = False
+    deep: bool = False                       # apply the snapshot in deep mode (set by the Worker for a handoff)
 
     @property
     def has_session(self) -> bool:
@@ -122,7 +124,8 @@ def parse_bundle(raw: str) -> Bundle:
         raise ValueError("claim bundle has no repository token")
     return Bundle(runner_token=token, session_id=sid, epoch=epoch, repo=repo,
                   image=vc.normalize_image(s.get("image")), repo_token=repo_token,
-                  repo_token_expires_at=parse_iso(s.get("repo_token_expires_at")), fresh=bool(s.get("fresh")))
+                  repo_token_expires_at=parse_iso(s.get("repo_token_expires_at")), fresh=bool(s.get("fresh")),
+                  deep=bool(s.get("deep")))
 
 
 # --------------------------------------------------------------------------- agent -> Worker
@@ -192,7 +195,8 @@ class SessionManager:
                  flags_dir: Path = Path("/tmp"), kill_jobs: Callable[[], None] = lambda: None,
                  log: Callable[[str], None] = lambda m: None, clock: Callable[[], float] = time.time,
                  sleep: Callable[[float], None] = time.sleep, autosave_idle_s: float = 60.0,
-                 autosave_interval_s: float = 600.0, poll_s: float = 5.0, job_drain_s: float = 30.0):
+                 autosave_interval_s: float = 600.0, poll_s: float = 5.0, job_drain_s: float = 30.0,
+                 handoff_drain_s: float = 600.0):
         if not bundle.has_session:
             raise ValueError("SessionManager needs a session bundle")
         self.b = bundle
@@ -204,10 +208,22 @@ class SessionManager:
         self.clock, self._sleep = clock, sleep
         self.autosave_idle_s, self.autosave_interval_s = autosave_idle_s, autosave_interval_s
         self.poll_s, self.job_drain_s = poll_s, job_drain_s
+        self.handoff_drain_s = handoff_drain_s    # a running job may finish for this long before a handoff stops it
+        self.handoff = False            # the shutdown under way is a handoff (jobs get 503 "handoff")
 
         self._cv = threading.Condition()
         self.state = "restoring"
-        self.capturing = False
+        self.capturing = False          # True only while the container is held still for the capture
+        self.uploading = False          # a captured snapshot is being uploaded (jobs may run meanwhile)
+        self.captured_seq: Optional[int] = None   # newest snapshot captured locally (maybe not yet durable)
+        self.upload_error: Optional[str] = None
+        self._upload_thread: Optional[threading.Thread] = None
+        self.history = None             # vm_history.HistoryStore, installed by the agent (set_history)
+        self.history_note: Optional[str] = None
+        self.deep_note: Optional[str] = None        # what the last deep apply found
+        self.deep_drift: Optional[dict] = None
+        self.last_save_deep = False
+        self._gen = 0                   # bumped whenever the filesystem may have changed
         self.error: Optional[str] = None
         self.progress = "starting"
         self.last_save: Optional[dict] = None
@@ -308,7 +324,10 @@ class SessionManager:
                 wd = cfg.get("workdir")
                 saved_wd = wd if isinstance(wd, str) and wd.startswith("/") else self.workdir
                 self._set_progress("applying the snapshot")
-                self.container.apply(restored.chunk_paths)
+                applied = self.container.apply(restored.chunk_paths)
+                extras = (applied or {}).get("extras") or {}
+                self._restore_history(extras)
+                self._apply_deep(extras, bool(cfg.get("deep")))
                 # the saved directory may no longer exist (deleted in the session); fall back to the default
                 self.workdir = self.container.workdir = self.container.ensure_workdir(saved_wd)
                 skipped = f" ({len(restored.skipped)} newer snapshot(s) were unusable)" if restored.skipped else ""
@@ -328,6 +347,36 @@ class SessionManager:
         finally:
             if restored is not None:
                 restored.cleanup()
+
+    def _apply_deep(self, extras: dict, snapshot_is_deep: bool) -> None:
+        """Deep apply happens only when this start asked for it (bundle.deep). Never fatal: the filesystem is already back."""
+        if not self.b.deep:
+            if snapshot_is_deep:
+                self.deep_note = "the snapshot is deep; applied as a normal restore (deep apply was not requested)"
+            return
+        if not snapshot_is_deep or "deep.json" not in extras:
+            self.deep_note = "deep apply requested, but this snapshot is a normal one; restored the filesystem only"
+            self.log(self.deep_note)
+            return
+        try:
+            self._set_progress("deep apply: restoring volumes and verifying packages")
+            res = self.container.apply_deep(extras)
+            self.deep_drift = res.get("report")
+            self.deep_note = f"deep apply: {res['volumes']} volume(s) restored; {res['summary']}"
+        except Exception as err:   # noqa: BLE001
+            self.deep_note = f"deep apply failed after the filesystem was restored: {self._short(err)}"
+        self.log(self.deep_note)
+
+    def _restore_history(self, extras: dict) -> None:
+        raw = extras.get("history.sqlite")
+        if self.history is None or raw is None:
+            return
+        try:
+            n = self.history.import_bytes(raw)
+            self.history_note = f"restored {n} history entr{'y' if n == 1 else 'ies'}"
+        except Exception as err:   # noqa: BLE001 - losing the history must not stop the session from starting
+            self.history_note = f"history in the snapshot was not restored: {self._short(err)}"
+        self.log(self.history_note)
 
     def _collect_garbage(self, keep_seq: int) -> None:
         """A run that was killed mid-upload leaves a draft release behind (possibly many GB). This start has the newest
@@ -363,23 +412,29 @@ class SessionManager:
         except Exception as err:  # the Worker learns the state from /status as well
             self.log(f"could not report '{type_}' to the Worker: {self._short(err)}")
 
+    def _reason(self) -> str:
+        """The 503 ``error`` value for a job refused now (call with ``_cv`` held)."""
+        return "handoff" if self.handoff and self.state == "stopping" else self.state
+
     # ---- jobs -------------------------------------------------------------
     def acquire_job(self) -> None:
         """Called by the agent before a job starts. Raises Unavailable (-> HTTP 503)."""
         with self._cv:
             if self.state != "ready":
-                raise Unavailable(self.state, self.error or self.progress)
+                raise Unavailable(self._reason(), self.error or self.progress)
             if self.capturing:
                 raise Unavailable("capturing", "a snapshot is being saved, retry in a moment")
             self._active_jobs += 1
             self._last_activity = self.clock()
             self._dirty = True
+            self._gen += 1
 
     def release_job(self, cwd: Optional[str] = None) -> None:
         with self._cv:
             self._active_jobs = max(0, self._active_jobs - 1)
             self._last_activity = self.clock()
             self._dirty = True
+            self._gen += 1
             if cwd and cwd.startswith("/"):
                 self.workdir = cwd
             self._cv.notify_all()
@@ -387,15 +442,21 @@ class SessionManager:
     def gate(self) -> Optional[Unavailable]:
         with self._cv:
             if self.state != "ready":
-                return Unavailable(self.state, self.error or self.progress)
+                return Unavailable(self._reason(), self.error or self.progress)
             if self.capturing:
                 return Unavailable("capturing", "a snapshot is being saved, retry in a moment")
         return None
 
     # ---- save -------------------------------------------------------------
-    def save(self, reason: str = "manual") -> dict:
+    def save(self, reason: str = "manual", background: bool = False, deep: bool = False) -> dict:
         """Capture, upload, verify and commit. The previous snapshot survives any failure. Raises Busy, Unavailable,
-        or a StoreError subclass with a message that is safe to show."""
+        or a StoreError subclass with a message that is safe to show.
+
+        The container is held still only while the snapshot is captured to local scratch space (``capturing``). With
+        ``background=True`` the call returns as soon as that is done (``{"status": "uploading", ...}``) and the upload
+        continues on its own thread (``uploading``); jobs may start again immediately. Only a snapshot that was uploaded,
+        verified and committed counts as saved: ``last_save`` / ``durable_seq`` move then and not before, and a failed
+        upload leaves the session dirty (``upload_error`` says why). One save/upload at a time."""
         final = reason == "shutdown"
         with self._cv:
             if self.state == "failed":
@@ -406,34 +467,96 @@ class SessionManager:
             if self._active_jobs:
                 raise Busy("a job is running; wait for it or stop it first")
             if not self._save_lock.acquire(blocking=False):
-                raise Busy("a save is already in progress")
+                raise Busy("a snapshot upload is still in progress" if self.uploading else "a save is already in progress")
             self.capturing = True
+            gen = self._gen
+        pending = None
         try:
             self._last_attempt = self.clock()
             cfg = {"image": self.b.image, "workdir": self.workdir}
-            summary = self.store.save(epoch=self.b.epoch, capture=self.container.capture, config=cfg,
-                                      fence=self._fence, progress=self._set_progress)
+            deep_extras: dict = {}
+            if deep:
+                self._set_progress("collecting deep data (package manifests, volumes)")
+                deep_extras = self.container.collect_deep()      # before the pause: docker exec needs a running container
+                cfg["deep"] = True
+            pending = self.store.capture_local(
+                epoch=self.b.epoch,
+                capture=lambda w: self.container.capture(w, extras=lambda: {**self._extras(), **deep_extras}),
+                config=cfg, progress=self._set_progress)
+            deep_extras = {}
+        except vs.Fenced:
+            self._capture_ended(failed=True)
+            self._supersede()
+            raise
+        except BaseException as err:
+            self._capture_ended(failed=True)
+            self.save_error = self._short(err)
+            self.progress = "save failed"
+            self.log(f"save failed ({reason}): {self.save_error}; the previous snapshot is kept")
+            raise
+        with self._cv:                  # the container is released: jobs may run while the upload goes on
+            self.capturing = False
+            self.uploading = True
+            self.captured_seq = pending.seq
+            self.upload_error = None
+            self._cv.notify_all()
+        if background:
+            t = threading.Thread(target=self._upload_quietly, args=(pending, reason, gen), name="session-upload", daemon=True)
+            self._upload_thread = t
+            self._threads.append(t)
+            t.start()
+            return {"status": "uploading", "seq": pending.seq, "bytes": pending.total}
+        return self._finish_upload(pending, reason, gen)
+
+    def _capture_ended(self, failed: bool) -> None:
+        with self._cv:
+            self.capturing = False
+            self._cv.notify_all()
+        if failed:
+            self._save_lock.release()
+
+    def _upload_quietly(self, pending, reason: str, gen: int) -> None:
+        try:
+            self._finish_upload(pending, reason, gen)
+        except BaseException:  # noqa: BLE001 - recorded in save_error / upload_error by _finish_upload; nobody to raise to
+            pass
+
+    def _finish_upload(self, pending, reason: str, gen: int) -> dict:
+        try:
+            summary = self.store.upload(pending, fence=self._fence, progress=self._set_progress)
             with self._cv:
                 self.last_save = {"seq": summary["seq"], "bytes": summary["bytes"], "at": summary.get("created_at")}
-                self.save_error = None
-                self._dirty = False
+                self.save_error = self.upload_error = None
+                self.last_save_deep = bool(pending.config.get("deep"))
+                if self._gen == gen:
+                    self._dirty = False          # nothing changed since the capture; otherwise it stays dirty
                 self._last_save_at = self.clock()
             self.progress = "saved"
             self.log(f"saved snapshot {summary['seq']} ({reason})")
             return summary
         except vs.Fenced:
+            self.upload_error = "superseded by a newer start"
             self._supersede()
             raise
         except BaseException as err:
-            self.save_error = self._short(err)
+            self.save_error = self.upload_error = self._short(err)
             self.progress = "save failed"
-            self.log(f"save failed ({reason}): {self.save_error}; the previous snapshot is kept")
+            self.log(f"upload failed ({reason}): {self.save_error}; the previous snapshot is kept, the session stays unsaved")
             raise
         finally:
+            pending.discard()
             with self._cv:
-                self.capturing = False
+                self.uploading = False
                 self._cv.notify_all()
             self._save_lock.release()
+
+    def wait_upload(self, timeout: Optional[float] = None) -> bool:
+        """Wait for a background upload to end. True when none is running (any more)."""
+        t = self._upload_thread
+        if t is not None and t.is_alive():
+            t.join(timeout)
+            return not t.is_alive()
+        return True
 
     def _fence(self, kind: str, info: dict) -> None:
         if kind == "commit":
@@ -447,26 +570,40 @@ class SessionManager:
             self.worker.event(kind, **info)
 
     # ---- shutdown ---------------------------------------------------------
-    def shutdown(self, force: bool = False) -> bool:
+    def shutdown(self, force: bool = False, handoff: bool = False) -> bool:
         """Start the graceful shutdown (idempotent). Returns True when this call started it. Raises Busy when a job is
-        running and force is False."""
+        running and force is False.
+
+        ``handoff=True`` is the planned hand-over to a replacement VM (keepalive's vm-handoff flag): new jobs get 503
+        ``handoff``; a running job may finish for up to ``handoff_drain_s`` before it is stopped (``force``); the final
+        save is a *deep* one; the Worker is told with a ``handoff`` event first and ``stopped(handoff=true, saved=...)``
+        last, and the usual vm-saved / vm-stop-now flags end the run."""
         with self._cv:
             if self.state in ("stopping", "stopped"):
                 return False
-            if self._active_jobs and not force:
+            if self._active_jobs and not force and not handoff:
                 raise Busy("a job is running; pass force to stop it")
             previous = self.state
             self.state = "stopping"
-            self.progress = "shutting down"
-        t = threading.Thread(target=self._shutdown, args=(previous, force), name="session-shutdown", daemon=True)
+            self.handoff = handoff
+            self.progress = "handing over to a new VM" if handoff else "shutting down"
+        if handoff:
+            self._notify("handoff", phase="draining" if self._active_jobs else "saving")
+        t = threading.Thread(target=self._shutdown, args=(previous, force, handoff), name="session-shutdown", daemon=True)
         t.start()
         self._threads.append(t)
         return True
 
-    def _shutdown(self, previous: str, force: bool) -> None:
+    def _shutdown(self, previous: str, force: bool, handoff: bool = False) -> None:
         saved, note = False, None
         try:
-            if self._active_jobs and force:
+            if handoff and self._active_jobs:
+                self.log(f"handoff: waiting up to {self.handoff_drain_s:.0f}s for the running job to finish")
+                end = self.clock() + self.handoff_drain_s
+                with self._cv:
+                    while self._active_jobs and self.clock() < end:
+                        self._cv.wait(0.2)
+            if self._active_jobs and (force or handoff):
                 self.log("stopping running jobs before the final save")
                 self._kill_jobs()
                 end = self.clock() + self.job_drain_s
@@ -474,12 +611,15 @@ class SessionManager:
                     while self._active_jobs and self.clock() < end:
                         self._cv.wait(0.2)
             if previous == "ready":
-                if not self._dirty and self.last_save:
+                self.wait_upload()          # a background upload in flight finishes (or fails) before we judge what is saved
+                if not self._dirty and self.last_save and (not handoff or self.last_save_deep):
                     saved, note = True, "nothing changed since the last snapshot"
                 else:
+                    if handoff:
+                        self._notify("handoff", phase="saving")
                     for attempt in (1, 2):
                         try:
-                            self.save("shutdown")
+                            self.save("shutdown", deep=handoff)
                             saved = True
                             break
                         except vs.Fenced:
@@ -506,7 +646,8 @@ class SessionManager:
                 if note and not saved:
                     self.error = note
                 self._cv.notify_all()
-            self._notify("stopped", saved=saved, **({"reason": note} if note else {}))
+            self._notify("stopped", saved=saved, **({"handoff": True} if handoff else {}),
+                         **({"reason": note} if note else {}))
             self._flag(FLAG_SAVED, "ok" if saved else "failed")
             self._flag(FLAG_STOP_NOW, "stopped")
             self._shutdown_done.set()
@@ -524,6 +665,12 @@ class SessionManager:
 
     def tick(self) -> None:
         """One iteration of the background loop (public so tests can drive it without threads)."""
+        if (self.flags / FLAG_HANDOFF).exists() and self.state in ("ready", "failed"):
+            try:      # a failed session has nothing to hand over: it just stops (and saves nothing)
+                self.shutdown(force=True, handoff=self.state == "ready")
+            except Busy:
+                pass
+            return
         if (self.flags / FLAG_STOPPING).exists() and self.state in ("ready", "failed"):
             try:
                 self.shutdown(force=True)
@@ -542,6 +689,17 @@ class SessionManager:
             except Exception:
                 pass          # already logged and recorded in save_error; retried after the interval
 
+    def set_history(self, history) -> None:
+        """The agent installs the host-side command history; it travels inside every snapshot."""
+        self.history = history
+
+    def _extras(self) -> dict:
+        """Host-side side data written into a snapshot (called while the container is paused)."""
+        out: dict = {}
+        if self.history is not None:
+            out["history.sqlite"] = self.history.export_bytes()
+        return out
+
     def set_kill_jobs(self, fn: Callable[[], None]) -> None:
         """The agent installs the callback that stops running jobs (it owns the JobManager)."""
         self._kill_jobs = fn
@@ -552,7 +710,14 @@ class SessionManager:
     # ---- status -----------------------------------------------------------
     def status(self) -> dict:
         with self._cv:
-            return {"state": self.state, "capturing": self.capturing, "id": self.b.session_id, "epoch": self.b.epoch,
+            return {"state": self.state, "handoff": self.handoff, "capturing": self.capturing, "uploading": self.uploading,
+                    "captured_seq": self.captured_seq, "durable_seq": (self.last_save or {}).get("seq"),
+                    "upload_error": self.upload_error, "history": self.history_note,
+                    "deep": {"last_save_deep": self.last_save_deep, "note": self.deep_note,
+                             "drift": self.deep_drift and {"clean": self.deep_drift.get("clean"),
+                                                           "sections": self.deep_drift.get("sections"),
+                                                           "tool_missing": self.deep_drift.get("tool_missing")}},
+                    "id": self.b.session_id, "epoch": self.b.epoch,
                     "image": self.b.image, "workdir": self.workdir, "last_save": self.last_save,
                     "progress": self.progress, "error": self.error, "save_error": self.save_error,
                     "dirty": self._dirty, "active_jobs": self._active_jobs}

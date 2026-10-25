@@ -190,6 +190,26 @@ def test_shutdown_saves_dirty_state_then_new_jobs_are_503(stack, mw):
     assert r.status_code == 503 and r.json()["error"] == "stopped"
 
 
+# --------------------------------------------------------------------------- handoff
+def test_handoff_drains_the_running_job_refuses_new_ones_with_503_handoff_then_saves_deep(stack, mw):
+    srv, m, c, flags = stack()
+    jid = srv.post("/jobs", {"command": "sleep 2; echo finished-before-handoff"}).json()["job_id"]
+    flags.mkdir(exist_ok=True)
+    (flags / "vm-handoff").write_text("Handoff time reached.")
+    m.tick()
+    r = srv.post("/jobs", {"command": "echo too-late"})
+    assert r.status_code == 503 and r.json()["error"] == "handoff"
+    assert srv.get("/status").json()["session"]["handoff"] is True
+    assert m.wait_stopped(90)
+    done = srv.get(f"/jobs/{jid}?wait=1").json()
+    assert done["status"] == "finished" and "finished-before-handoff" in done["output"], "the running job was not killed"
+    assert (flags / "vm-saved").read_text() == "ok" and (flags / "vm-stop-now").exists()
+    stopped = [e for e in mw.events if e["type"] == "stopped"][-1]
+    assert stopped["saved"] is True and stopped["handoff"] is True
+    assert m.last_save_deep is True
+    assert srv.post("/jobs", {"command": "echo later"}).json()["error"] == "stopped"
+
+
 # --------------------------------------------------------------------------- relay into the container
 @pytest.fixture
 def fake_relay(tmp_path, monkeypatch):

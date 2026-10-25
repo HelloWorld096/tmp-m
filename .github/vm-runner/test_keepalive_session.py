@@ -148,3 +148,51 @@ def test_without_a_session_the_stop_flags_are_never_written(tmp_path):
         p.kill()
     finally:
         s.kill()
+
+
+def test_session_vm_hands_over_instead_of_stopping_after_the_handoff_time(tmp_path):
+    s = _alive_pid(tmp_path)
+    try:
+        p, flags = _run(tmp_path, pid=s.pid, extra={"VM_MAX_SECONDS": "100", "VM_SESSION_RESERVE_SECONDS": "40",
+                                                    "VM_HANDOFF_SECONDS": "1"})
+        assert _wait_for(flags / "vm-handoff"), "keepalive must ask for a handoff"
+        assert "Handoff" in (flags / "vm-handoff").read_text()
+        assert not (flags / "vm-stopping").exists()
+        time.sleep(0.8)
+        assert p.poll() is None, "the run must stay up until the agent has saved"
+        (flags / "vm-saved").write_text("ok")
+        assert _done(p, 5), "the run must end once the handoff save is reported"
+    finally:
+        s.kill()
+
+
+def test_handoff_save_that_never_finishes_cannot_hold_the_run(tmp_path):
+    s = _alive_pid(tmp_path)
+    try:
+        p, flags = _run(tmp_path, pid=s.pid, extra={"VM_MAX_SECONDS": "100", "VM_SESSION_RESERVE_SECONDS": "40",
+                                                    "VM_HANDOFF_SECONDS": "1", "VM_SAVE_WAIT_SECONDS": "2"})
+        assert _wait_for(flags / "vm-handoff")
+        assert _done(p, 8), "the save wait must still be bounded"
+    finally:
+        s.kill()
+
+
+def test_handoff_is_off_when_it_would_not_come_before_the_session_stop(tmp_path):
+    s = _alive_pid(tmp_path)
+    try:
+        p, flags = _run(tmp_path, pid=s.pid, extra={"VM_MAX_SECONDS": "100", "VM_SESSION_RESERVE_SECONDS": "40",
+                                                    "VM_HANDOFF_SECONDS": "90"})
+        time.sleep(1.0)
+        assert not (flags / "vm-handoff").exists()
+        assert p.poll() is None
+        p.kill()
+    finally:
+        s.kill()
+
+
+def test_a_plain_vm_never_writes_the_handoff_flag(tmp_path):
+    p, flags = _run(tmp_path, session=False, extra={"VM_MAX_SECONDS": "100", "VM_HANDOFF_SECONDS": "1"})
+    time.sleep(1.5)
+    assert not (flags / "vm-handoff").exists()
+    assert p.poll() is None
+    p.kill()

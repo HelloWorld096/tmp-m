@@ -19,6 +19,11 @@
 # The agent's vm-stop-now flag (written after any shutdown, or when this runner was superseded) ends the run at
 # any time. A dead agent still ends the run immediately: nothing is left that could save.
 #
+# Handoff: a session VM that has been up for VM_HANDOFF_SECONDS (default 5 h) writes vm-handoff instead of vm-stopping. The
+# agent then refuses new jobs, lets a running job finish (bounded), makes a deep save and reports "handoff" so the Worker can
+# start the replacement VM from that snapshot. From there it is the same wait as for vm-stopping (vm-saved / vm-stop-now /
+# VM_SAVE_WAIT_SECONDS / hard limit). Handoff is for session VMs only; a plain VM never writes it.
+#
 # All knobs are environment variables so tests can run it in seconds.
 set -uo pipefail
 
@@ -36,6 +41,7 @@ DEAD_STALE="${VM_DEAD_STALE_SECONDS:-120}"
 FLAGS_DIR="${VM_FLAGS_DIR:-/tmp}"                      # same directory the agent's SessionManager writes its flags to
 SAVE_WAIT="${VM_SAVE_WAIT_SECONDS:-1500}"              # 25 min for the final save
 SESSION_RESERVE="${VM_SESSION_RESERVE_SECONDS:-1800}"  # session VMs start stopping this long before MAX_RUNTIME
+HANDOFF_AFTER="${VM_HANDOFF_SECONDS:-18000}"            # session VMs hand over to a replacement after this long (5 h)
 
 started=$(cat "$START_FILE" 2>/dev/null || true)
 case "$started" in ''|*[!0-9]*) started=$(date +%s) ;; esac
@@ -43,6 +49,8 @@ case "$started" in ''|*[!0-9]*) started=$(date +%s) ;; esac
 # A session VM stops earlier, to leave time for the final save. Never less than half the lifetime (misconfiguration guard).
 SESSION_LIMIT=$((MAX_RUNTIME - SESSION_RESERVE))
 if [ "$SESSION_LIMIT" -lt $((MAX_RUNTIME / 2)) ]; then SESSION_LIMIT=$((MAX_RUNTIME / 2)); fi
+# A handoff only makes sense before the early session stop; at or after it (or with 0) it is switched off.
+if [ "$HANDOFF_AFTER" -le 0 ] || [ "$HANDOFF_AFTER" -ge "$SESSION_LIMIT" ]; then HANDOFF_AFTER=0; fi
 
 dead=0
 stopping_since=0
@@ -78,10 +86,16 @@ while true; do
     last=$(stat -c %Y "$ACTIVITY_FILE" 2>/dev/null || echo "$now")
     age=$((now - last))
     if [ -z "$reason" ] && [ "$age" -ge "$IDLE_LIMIT" ]; then reason="Idle timeout reached."; fi
+    handoff=0
+    if [ -z "$reason" ] && [ "$session" = 1 ] && [ "$HANDOFF_AFTER" -gt 0 ] && [ $((now - started)) -ge "$HANDOFF_AFTER" ]; then
+      reason="Handoff time reached."; handoff=1
+    fi
     if [ -n "$reason" ]; then
       if [ "$session" = 1 ]; then
+        flag=vm-stopping
+        if [ "$handoff" = 1 ]; then flag=vm-handoff; fi
         echo "$reason Asking the session to save before the run ends."
-        printf '%s' "$reason" > "$FLAGS_DIR/vm-stopping" || { echo "Could not write the stop flag; ending the run."; exit 0; }
+        printf '%s' "$reason" > "$FLAGS_DIR/$flag" || { echo "Could not write the stop flag; ending the run."; exit 0; }
         stopping_since=$now
       else
         echo "$reason"
