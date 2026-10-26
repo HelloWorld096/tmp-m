@@ -50,6 +50,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 import vm_history
+import vm_live
 
 try:  # session persistence is optional: without these files the agent behaves exactly as before
     import vm_session
@@ -64,6 +65,8 @@ OUTPUT_TAIL_CHARS_FINISHED = 60_000
 OUTPUT_TAIL_CHARS_RUNNING = 20_000
 MAX_OUTPUT_BYTES = 100 * 1024 * 1024
 KEEP_JOBS = 20
+DASH_MAX_PARALLEL = 4          # the dashboard's own terminal: at most this many commands at once, in a lane of their own
+KEEP_DASH_JOBS = 30            # retained separately, so dashboard commands never push an MCP job out of reach of bash_status
 KILL_GRACE_SECONDS = 5
 
 SENSITIVE_ENV_EXACT = {"SESSION_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"}
@@ -139,6 +142,13 @@ def sweep_marked_processes() -> int:
     return killed
 
 
+class TooMany(Exception):
+    """The dashboard lane is full (DASH_MAX_PARALLEL commands are running)."""
+    def __init__(self, limit: int):
+        super().__init__(limit)
+        self.limit = limit
+
+
 class Busy(Exception):
     def __init__(self, job_id: str):
         super().__init__(job_id)
@@ -168,6 +178,8 @@ class Job:
         self.cleanup_files: list[Path] = []
         self.in_container = False
         self.record = False
+        self.lane = "mcp"               # "dash": started from the dashboard terminal, runs beside the MCP lane
+        self.description: Optional[str] = None
 
     @property
     def state(self) -> str:
@@ -222,6 +234,7 @@ class JobManager:
         self.lock = threading.Lock()
         self.current: Optional[Job] = None
         self.jobs: "OrderedDict[str, Job]" = OrderedDict()
+        self.dash_jobs: "OrderedDict[str, Job]" = OrderedDict()
         self.by_request: dict[str, Job] = {}
         JOBS_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
         if self.history is not None:
@@ -229,7 +242,8 @@ class JobManager:
 
     # -- lifecycle ---------------------------------------------------------
     def submit(self, command: str, timeout: int, request_id: Optional[str] = None, cleanup_files: Optional[list[Path]] = None,
-               on_host: bool = False, record: bool = False, replay_of: Optional[str] = None) -> tuple[Job, bool]:
+               on_host: bool = False, record: bool = False, replay_of: Optional[str] = None,
+               description: Optional[str] = None, lane: str = "mcp") -> tuple[Job, bool]:
         """Start a job. Returns (job, duplicate); duplicate=True means request_id was already seen.
 
         With a session attached the command runs inside the session container, except ``on_host`` jobs (the relay
@@ -239,42 +253,54 @@ class JobManager:
         refusals (busy, restoring, ...), which get their own id so they can be replayed later.
         """
         try:
-            return self._submit(command, timeout, request_id, cleanup_files, on_host, record, replay_of)
+            return self._submit(command, timeout, request_id, cleanup_files, on_host, record, replay_of, description, lane)
         except Busy:
-            self._note_rejected(record, command, timeout, request_id, replay_of, "busy")
+            self._note_rejected(record, command, timeout, request_id, replay_of, "busy", description, lane)
+            raise
+        except TooMany:
+            self._note_rejected(record, command, timeout, request_id, replay_of, "too_many", description, lane)
             raise
         except Exception as err:
             if vm_session is not None and isinstance(err, vm_session.Unavailable):
-                self._note_rejected(record, command, timeout, request_id, replay_of, err.reason)
+                self._note_rejected(record, command, timeout, request_id, replay_of, err.reason, description, lane)
             raise
 
-    def _note_rejected(self, record, command, timeout, request_id, replay_of, reason) -> None:
+    def _note_rejected(self, record, command, timeout, request_id, replay_of, reason, description=None, lane="mcp") -> None:
         if record and self.history is not None:
             try:
                 self.history.record_attempt(uuid.uuid4().hex[:16], command, timeout, request_id,
-                                            kind="replay" if replay_of else "run", replay_of=replay_of, rejected=reason)
+                                            kind="replay" if replay_of else "run", replay_of=replay_of, rejected=reason,
+                                            description=description, source=lane)
             except Exception:  # noqa: BLE001 - the history must never make a refusal fail differently
                 pass
 
-    def _submit(self, command, timeout, request_id, cleanup_files, on_host, record, replay_of):
+    def _submit(self, command, timeout, request_id, cleanup_files, on_host, record, replay_of, description=None, lane="mcp"):
         with self.lock:
             # Replay check comes first: a retry of a submission that already started must get its own
             # job back, not "busy" (the job it started is what is keeping the agent busy).
             if request_id is not None and request_id in self.by_request:
                 return self.by_request[request_id], True
+            dash = lane == "dash"
             if self.session is not None and getattr(self.session, "handoff", False):
                 # While a handoff drains the running job, new commands must hear "handoff" (the Worker queues them for
                 # the replacement VM), not "busy" (which would mean: retry here shortly).
                 refused = self.session.gate()
                 if refused is not None:
                     raise refused
-            if self.current is not None and not self.current.done.is_set():
+            if dash:
+                # The dashboard's lane never looks at `current`: an MCP command in progress does not block it, and
+                # it never blocks the MCP lane. It has its own small cap.
+                if sum(1 for j in self.dash_jobs.values() if not j.done.is_set()) >= DASH_MAX_PARALLEL:
+                    raise TooMany(DASH_MAX_PARALLEL)
+            elif self.current is not None and not self.current.done.is_set():
                 raise Busy(self.current.id)
             if self.session is not None:
                 self.session.acquire_job()      # raises Unavailable while restoring/capturing/failed/stopping
             job_dir = JOBS_DIR / uuid.uuid4().hex
             job_dir.mkdir(mode=0o700)
             job = Job(command, timeout, job_dir, request_id)
+            job.lane = "dash" if dash else "mcp"
+            job.description = vm_history.clean_description(description)
             job.in_container = self.session is not None and not on_host
             job.cleanup_files = list(cleanup_files or [])
             job.output_path.touch(mode=0o600)
@@ -311,13 +337,17 @@ class JobManager:
                 raise
             finally:
                 out.close()
-            self.current = job
-            self.jobs[job.id] = job
+            if dash:
+                self.dash_jobs[job.id] = job
+            else:
+                self.current = job
+                self.jobs[job.id] = job
             job.record = bool(record and self.history is not None)
             if job.record:
                 try:
                     self.history.record_attempt(job.id, command, timeout, request_id,
-                                                kind="replay" if replay_of else "run", replay_of=replay_of)
+                                                kind="replay" if replay_of else "run", replay_of=replay_of,
+                                                description=job.description, source=job.lane)
                 except Exception:  # noqa: BLE001
                     job.record = False
             if request_id is not None:
@@ -333,7 +363,16 @@ class JobManager:
 
     def get(self, job_id: str) -> Optional[Job]:
         with self.lock:
-            return self.jobs.get(job_id)
+            return self.jobs.get(job_id) or self.dash_jobs.get(job_id)
+
+    def running_dash(self) -> list:
+        with self.lock:
+            return [j for j in self.dash_jobs.values() if not j.done.is_set()]
+
+    def all_running(self) -> list:
+        """Every job that is still running, both lanes (for the live view)."""
+        with self.lock:
+            return [j for j in list(self.jobs.values()) + list(self.dash_jobs.values()) if not j.done.is_set()]
 
     def cancel(self, job: Job) -> None:
         proc = job.proc
@@ -351,22 +390,23 @@ class JobManager:
 
     # -- internals ---------------------------------------------------------
     def _prune(self) -> None:
-        while len(self.jobs) > KEEP_JOBS:
-            old_id, old = next(iter(self.jobs.items()))
-            if not old.done.is_set():
-                break
-            self.jobs.pop(old_id)
-            if old.request_id is not None:
-                self.by_request.pop(old.request_id, None)
-            for p in (old.output_path, old.meta_path):
+        for table, keep in ((self.jobs, KEEP_JOBS), (self.dash_jobs, KEEP_DASH_JOBS)):
+            while len(table) > keep:
+                old_id, old = next(iter(table.items()))
+                if not old.done.is_set():
+                    break
+                table.pop(old_id)
+                if old.request_id is not None:
+                    self.by_request.pop(old.request_id, None)
+                for p in (old.output_path, old.meta_path):
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
                 try:
-                    p.unlink()
+                    old.dir.rmdir()
                 except OSError:
                     pass
-            try:
-                old.dir.rmdir()
-            except OSError:
-                pass
 
     def _kill(self, job: Job) -> None:
         self._kill_group(job)
@@ -447,9 +487,11 @@ class JobManager:
         if self.session is not None and not job.in_container:
             job.cwd = self.session.workdir      # a host-side relay job: the session's directory is what matters
         else:
-            if cwd and (job.in_container or os.path.isdir(cwd)):
+            # Only the MCP lane moves the shared working directory: a dashboard command that cd's elsewhere must not
+            # change where the next MCP command starts.
+            if job.lane == "mcp" and cwd and (job.in_container or os.path.isdir(cwd)):
                 self.cwd = cwd
-            job.cwd = self.cwd
+            job.cwd = (cwd if job.lane == "dash" and cwd else self.cwd)
         if job.timed_out:
             job.exit_code = 124
         elif job.cancel_requested:
@@ -467,13 +509,14 @@ class JobManager:
         job.ended = time.time()
         job.done.set()
         if self.session is not None:
-            self.session.release_job(job.cwd if job.in_container else None)
+            self.session.release_job(job.cwd if job.in_container and job.lane == "mcp" else None)
         touch_activity()
         # After the slot is released: the database write must never delay the next command or the workdir update.
         if job.record and self.history is not None:
             try:
                 tail, _ = job.read_output(2_000)
-                self.history.finish(job.id, job.state, job.exit_code, job.cwd, tail)
+                size = job.output_path.stat().st_size if job.output_path.exists() else None
+                self.history.finish(job.id, job.state, job.exit_code, job.cwd, tail, size)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -489,6 +532,7 @@ class JobRequest(BaseModel):
     replay_of: Optional[str] = Field(default=None, pattern=REPLAY_ID_RE)
     timeout_seconds: Optional[int] = Field(default=None, ge=1, le=MAX_JOB_SECONDS)
     request_id: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    description: Optional[str] = Field(default=None, max_length=vm_history.MAX_DESCRIPTION_CHARS * 2)
 
     @model_validator(mode="after")
     def _need_command_or_replay(self):
@@ -582,10 +626,10 @@ def create_app(token: str, workspace: str, session=None, history=None) -> FastAP
     saver = SaveRunner(session) if session is not None else None
 
     def kill_jobs() -> None:
-        job = manager.running()
-        if job is not None:
-            manager.cancel(job)
-            job.done.wait(timeout=KILL_GRACE_SECONDS + 10)
+        for job in [manager.running()] + manager.running_dash():
+            if job is not None:
+                manager.cancel(job)
+                job.done.wait(timeout=KILL_GRACE_SECONDS + 10)
         manager.sweep()
 
     if session is not None:
@@ -640,7 +684,8 @@ def create_app(token: str, workspace: str, session=None, history=None) -> FastAP
             raise HTTPException(status_code=400, detail="command too long")
         try:
             job, duplicate = manager.submit(
-                command, timeout or DEFAULT_JOB_SECONDS, req.request_id, record=True, replay_of=req.replay_of
+                command, timeout or DEFAULT_JOB_SECONDS, req.request_id, record=True, replay_of=req.replay_of,
+                description=req.description,
             )
         except Busy as busy:
             return JSONResponse(
@@ -650,25 +695,119 @@ def create_app(token: str, workspace: str, session=None, history=None) -> FastAP
             return _unavailable(err)
         return {"job_id": job.id, "status": job.state, "duplicate": duplicate, "replay_of": req.replay_of}
 
+    @app.post("/dash/jobs", dependencies=[Depends(require_auth)])
+    def submit_dash(req: JobRequest):
+        """The owner dashboard's own terminal. A lane of its own: it runs beside an MCP command (never blocked by one,
+        never blocking one) and is capped at DASH_MAX_PARALLEL at a time. Same validation and history as /jobs."""
+        if req.command is None or not req.command.strip():
+            raise HTTPException(status_code=400, detail="Missing command")
+        try:
+            job, duplicate = manager.submit(req.command, req.timeout_seconds or DEFAULT_JOB_SECONDS, req.request_id,
+                                            record=True, description=req.description, lane="dash")
+        except TooMany as many:
+            return JSONResponse(status_code=429, content={"error": "too_many", "limit": many.limit})
+        except vm_session.Unavailable as err:
+            return _unavailable(err)
+        return {"job_id": job.id, "status": job.state, "duplicate": duplicate, "lane": "dash"}
+
+    _list_row = vm_history.list_view
+
     @app.get("/history", dependencies=[Depends(require_auth)])
-    def get_history(limit: int = 10):
-        """The latest attempts (newest first), including refused ones. Commands are shortened here; see /history/{id}."""
-        rows = history.recent(limit)
-        out = []
-        for r in rows:
-            v = vm_history.public_view(r, with_command=False)
-            cmd = r["command"]
-            v["command"] = cmd if len(cmd) <= 300 else cmd[:300] + "..."
-            v["command_chars"] = len(cmd)
-            out.append(v)
-        return {"jobs": out, "total": history.count()}
+    def get_history(limit: int = 10, before: Optional[int] = None, source: Optional[str] = None,
+                    status: Optional[str] = None, q: Optional[str] = None):
+        """Attempts, newest first, including refused ones. Commands are shortened here; see /history/{id}.
+        ``before`` is the seq of the last row already shown (lazy loading); source=mcp|dash and status=ok|failed|running
+        and q (text in the command, description or id) narrow the list. ``next_before`` is null on the last page."""
+        rows, nxt = history.page(limit, before, source, status, (q or "")[:100] or None)
+        return {"jobs": [_list_row(r) for r in rows], "total": history.count(), "next_before": nxt}
+
+    live_feed = vm_live.LiveFeed(manager, history, session)
+    live_state: dict = {"streamer": None}
+
+    def _streamer():
+        """One streamer per agent. It dials the Worker address this VM was configured with (never one a caller names)."""
+        if live_state["streamer"] is None:
+            base = os.environ.get("VM_BASE_URL", "").strip()
+            if not base:
+                return None
+            # VM_LIVE_* only exist so the tests can run the stream at a faster pace
+            live_state["streamer"] = vm_live.LiveStreamer(
+                base, token, live_feed, allow_http=os.environ.get("VM_SNAPSHOT_TEST") == "1",
+                interval=float(os.environ.get("VM_LIVE_INTERVAL_S", vm_live.INTERVAL_S)),
+                idle_grace=float(os.environ.get("VM_LIVE_IDLE_GRACE_S", vm_live.IDLE_GRACE_S)),
+                log=lambda m: print(f"[live] {m}", file=sys.stderr))
+        return live_state["streamer"]
+
+    @app.post("/live/start", dependencies=[Depends(require_auth)])
+    def live_start():
+        """The Worker calls this when a viewer connects. The agent then opens ONE outbound socket to the Worker and streams
+        about once a second until the Worker says nobody is watching. Calling it while streaming does nothing."""
+        try:
+            streamer = _streamer()
+        except ValueError as err:
+            raise HTTPException(status_code=501, detail=str(err))
+        if streamer is None:
+            raise HTTPException(status_code=501, detail="this VM does not know the Worker address (VM_BASE_URL), so it cannot stream")
+        started = streamer.start()
+        touch_activity()
+        return {"started": started, **streamer.status()}
+
+    @app.post("/live/stop", dependencies=[Depends(require_auth)])
+    def live_stop():
+        streamer = live_state["streamer"]
+        if streamer is not None:
+            streamer.stop()
+        return {"stopping": streamer is not None}
+
+    @app.get("/live/status", dependencies=[Depends(require_auth)])
+    def live_status():
+        streamer = live_state["streamer"]
+        return streamer.status() if streamer is not None else {"running": False, "viewers": None, "frames": 0, "since": None, "error": None}
+
+    @app.get("/history/{job_id}/output", dependencies=[Depends(require_auth)])
+    def get_history_output(job_id: str, offset: int = 0, limit: int = 65_536):
+        """The full output of a job whose output file is still kept (the latest KEEP_JOBS of each lane), by byte range, so
+        a big output loads in pages and a running job can be followed (poll with the returned next_offset). Older jobs
+        only have the saved tail."""
+        row = history.get(job_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="unknown job id")
+        job = manager.get(job_id)
+        limit = max(1, min(int(limit), 262_144))
+        offset = max(0, int(offset))
+        if job is None or not job.output_path.exists():
+            tail = row["output_tail"] or ""
+            return {"text": tail[offset:offset + limit] if offset < len(tail) else "", "offset": offset,
+                    "next_offset": min(len(tail), offset + limit), "total": len(tail), "complete": True, "retained": False}
+        size = job.output_path.stat().st_size
+        with open(job.output_path, "rb") as fh:
+            fh.seek(min(offset, size))
+            raw = fh.read(limit)
+        end = min(offset, size) + len(raw)
+        # never cut a UTF-8 character in half: hold back an incomplete tail until more bytes exist
+        if end < size or not job.done.is_set():
+            for back in range(min(3, len(raw))):
+                try:
+                    raw[:len(raw) - back].decode("utf-8")
+                    if back:
+                        raw, end = raw[:len(raw) - back], end - back
+                    break
+                except UnicodeDecodeError:
+                    continue
+        return {"text": raw.decode("utf-8", errors="replace"), "offset": offset, "next_offset": end, "total": size,
+                "complete": job.done.is_set() and end >= size, "retained": True}
 
     @app.get("/history/{job_id}", dependencies=[Depends(require_auth)])
     def get_history_item(job_id: str):
         row = history.get(job_id)
         if row is None:
             raise HTTPException(status_code=404, detail="unknown job id")
-        return {**vm_history.public_view(row), "output_tail": row["output_tail"]}
+        live = manager.get(job_id)
+        tail = row["output_tail"]
+        if live is not None and not live.done.is_set():
+            tail = live.read_output(OUTPUT_TAIL_CHARS_RUNNING)[0]
+        return {**vm_history.public_view(row), "output_tail": tail,
+                "output_retained": bool(live is not None and live.output_path.exists())}
 
     @app.post("/relay/jobs", dependencies=[Depends(require_auth)])
     def submit_relay(req: RelayJobRequest, request: Request):

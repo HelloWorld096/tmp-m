@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
+import vm_activity
 import vm_container as vc
 import vm_snapshot as vs
 
@@ -226,6 +227,7 @@ class SessionManager:
         self._gen = 0                   # bumped whenever the filesystem may have changed
         self.error: Optional[str] = None
         self.progress = "starting"
+        self.activity = vm_activity.Activity()      # structured view of progress, for the dashboard
         self.last_save: Optional[dict] = None
         self.save_error: Optional[str] = None
         self.workdir = vc.DEFAULT_WORKDIR
@@ -264,6 +266,7 @@ class SessionManager:
 
     def _set_progress(self, msg: str) -> None:
         self.progress = msg
+        self.activity.set(msg)
 
     def _repo_token(self) -> str:
         """Token provider handed to the store. Refreshes through the Worker when less than 5 minutes remain; a failed
@@ -338,7 +341,7 @@ class SessionManager:
             with self._cv:
                 if self.state == "restoring":
                     self.state = "ready"
-                    self.progress = "ready"
+                    self._set_progress("ready")
                 self._last_activity = self._last_save_at = self.clock()
                 self._cv.notify_all()
             self._collect_garbage(int((restored.manifest.get("seq") if restored else 0) or 0))
@@ -400,7 +403,7 @@ class SessionManager:
                 return
             self.state = "failed"
             self.error = reason
-            self.progress = "failed"
+            self._set_progress("failed")
             self._cv.notify_all()
         self._notify("failed", reason=reason)
 
@@ -491,7 +494,7 @@ class SessionManager:
         except BaseException as err:
             self._capture_ended(failed=True)
             self.save_error = self._short(err)
-            self.progress = "save failed"
+            self._set_progress("save failed")
             self.log(f"save failed ({reason}): {self.save_error}; the previous snapshot is kept")
             raise
         with self._cv:                  # the container is released: jobs may run while the upload goes on
@@ -531,7 +534,7 @@ class SessionManager:
                 if self._gen == gen:
                     self._dirty = False          # nothing changed since the capture; otherwise it stays dirty
                 self._last_save_at = self.clock()
-            self.progress = "saved"
+            self._set_progress("saved")
             self.log(f"saved snapshot {summary['seq']} ({reason})")
             return summary
         except vs.Fenced:
@@ -540,7 +543,7 @@ class SessionManager:
             raise
         except BaseException as err:
             self.save_error = self.upload_error = self._short(err)
-            self.progress = "save failed"
+            self._set_progress("save failed")
             self.log(f"upload failed ({reason}): {self.save_error}; the previous snapshot is kept, the session stays unsaved")
             raise
         finally:
@@ -586,7 +589,7 @@ class SessionManager:
             previous = self.state
             self.state = "stopping"
             self.handoff = handoff
-            self.progress = "handing over to a new VM" if handoff else "shutting down"
+            self._set_progress("handing over to a new VM" if handoff else "shutting down")
         if handoff:
             self._notify("handoff", phase="draining" if self._active_jobs else "saving")
         t = threading.Thread(target=self._shutdown, args=(previous, force, handoff), name="session-shutdown", daemon=True)
@@ -642,7 +645,7 @@ class SessionManager:
                 self.log(f"could not remove the container: {self._short(err)}")
             with self._cv:
                 self.state = "stopped"
-                self.progress = "stopped"
+                self._set_progress("stopped")
                 if note and not saved:
                     self.error = note
                 self._cv.notify_all()
@@ -720,6 +723,7 @@ class SessionManager:
                     "id": self.b.session_id, "epoch": self.b.epoch,
                     "image": self.b.image, "workdir": self.workdir, "last_save": self.last_save,
                     "progress": self.progress, "error": self.error, "save_error": self.save_error,
+                    "activity": self.activity.snapshot(), "paused": self.capturing,
                     "dirty": self._dirty, "active_jobs": self._active_jobs}
 
 

@@ -24,13 +24,21 @@ import time
 from pathlib import Path
 from typing import Optional
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2          # 2 adds description, source, output_bytes (older databases and snapshots are upgraded on load)
 OUTPUT_TAIL_CHARS = 2_000
 MAX_IMPORT_BYTES = 256 * 1024 * 1024
 COLUMNS = (
     "seq", "job_id", "request_id", "kind", "replay_of", "command", "timeout_seconds", "outcome", "reject_reason",
-    "status", "exit_code", "cwd", "submitted_at", "ended_at", "output_tail",
+    "status", "exit_code", "cwd", "submitted_at", "ended_at", "output_tail", "description", "source", "output_bytes",
 )
+# Columns added after version 1: (name, definition). Applied to an existing database by _upgrade().
+_ADDED = (
+    ("description", "TEXT"),
+    ("source", "TEXT NOT NULL DEFAULT 'mcp'"),     # 'mcp' = a command from the MCP tools, 'dash' = the dashboard's own terminal
+    ("output_bytes", "INTEGER"),
+)
+MAX_DESCRIPTION_CHARS = 200
+MAX_PAGE = 100
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -49,7 +57,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     cwd             TEXT,
     submitted_at    REAL NOT NULL,
     ended_at        REAL,
-    output_tail     TEXT
+    output_tail     TEXT,
+    description     TEXT,
+    source          TEXT NOT NULL DEFAULT 'mcp',
+    output_bytes    INTEGER
 );
 CREATE INDEX IF NOT EXISTS jobs_request ON jobs(request_id);
 """
@@ -78,13 +89,22 @@ class HistoryStore:
         db = self._connect()
         try:
             db.executescript(_SCHEMA)
-            db.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
+            self._upgrade(db)
+            db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
         finally:
             db.close()
         try:
             os.chmod(self.path, 0o600)
         except OSError:
             pass
+
+    @staticmethod
+    def _upgrade(db: sqlite3.Connection) -> None:
+        """A database made by an older agent lacks the newer columns: add them (existing rows read as source 'mcp')."""
+        have = {r[1] for r in db.execute("PRAGMA table_info(jobs)")}
+        for name, definition in _ADDED:
+            if name not in have:
+                db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=30, isolation_level=None)
@@ -110,21 +130,23 @@ class HistoryStore:
 
     # ---- recording ----
     def record_attempt(self, job_id: str, command: str, timeout_seconds: Optional[int], request_id: Optional[str] = None,
-                       kind: str = "run", replay_of: Optional[str] = None, rejected: Optional[str] = None) -> None:
+                       kind: str = "run", replay_of: Optional[str] = None, rejected: Optional[str] = None,
+                       description: Optional[str] = None, source: str = "mcp") -> None:
         """One row per submission. ``rejected`` is the reason when the agent refused it (the command did NOT run)."""
         now = time.time()
         self._run(
             "INSERT INTO jobs(job_id, request_id, kind, replay_of, command, timeout_seconds, outcome, reject_reason,"
-            " status, submitted_at, ended_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            " status, submitted_at, ended_at, description, source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (job_id, request_id, kind, replay_of, command, timeout_seconds,
              "rejected" if rejected else "accepted", rejected, "rejected" if rejected else "running", now,
-             now if rejected else None),
+             now if rejected else None, clean_description(description), "dash" if source == "dash" else "mcp"),
         )
 
-    def finish(self, job_id: str, status: str, exit_code: Optional[int], cwd: Optional[str], output_tail: str) -> None:
+    def finish(self, job_id: str, status: str, exit_code: Optional[int], cwd: Optional[str], output_tail: str,
+               output_bytes: Optional[int] = None) -> None:
         self._run(
-            "UPDATE jobs SET status=?, exit_code=?, cwd=?, ended_at=?, output_tail=? WHERE job_id=?",
-            (status, exit_code, cwd, time.time(), output_tail[-OUTPUT_TAIL_CHARS:], job_id),
+            "UPDATE jobs SET status=?, exit_code=?, cwd=?, ended_at=?, output_tail=?, output_bytes=? WHERE job_id=?",
+            (status, exit_code, cwd, time.time(), output_tail[-OUTPUT_TAIL_CHARS:], output_bytes, job_id),
         )
 
     def interrupt_running(self, why: str = "interrupted") -> int:
@@ -144,6 +166,35 @@ class HistoryStore:
         """Newest first."""
         limit = max(1, min(int(limit), 500))
         return [self._row(r) for r in self._all("SELECT * FROM jobs ORDER BY seq DESC LIMIT ?", (limit,))]
+
+    # Statuses that count as "failed" in the list filter: a non-zero exit, a kill, a refusal or a command lost to a restart.
+    _FAILED_SQL = "(status IN ('timed_out','cancelled','rejected','interrupted') OR (status='finished' AND COALESCE(exit_code,0)!=0))"
+
+    def page(self, limit: int = 30, before: Optional[int] = None, source: Optional[str] = None,
+             status: Optional[str] = None, q: Optional[str] = None) -> tuple:
+        """Newest first. ``before`` is the ``seq`` of the last row already shown (keyset paging: the cost of a page does
+        not grow with how far back it is). Returns (rows, next_before) where next_before is None on the last page."""
+        limit = max(1, min(int(limit), MAX_PAGE))
+        where, args = [], []
+        if before is not None:
+            where.append("seq < ?"); args.append(int(before))
+        if source in ("mcp", "dash"):
+            where.append("source = ?"); args.append(source)
+        if status == "failed":
+            where.append(self._FAILED_SQL)
+        elif status == "ok":
+            where.append("status='finished' AND COALESCE(exit_code,0)=0")
+        elif status == "running":
+            where.append("status='running'")
+        if q:
+            like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            where.append("(command LIKE ? ESCAPE '\\' OR COALESCE(description,'') LIKE ? ESCAPE '\\' OR job_id LIKE ? ESCAPE '\\')")
+            args += [like, like, like]
+        sql = "SELECT * FROM jobs" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY seq DESC LIMIT ?"
+        rows = [self._row(r) for r in self._all(sql, tuple(args) + (limit + 1,))]
+        more = len(rows) > limit
+        rows = rows[:limit]
+        return rows, (rows[-1]["seq"] if more and rows else None)
 
     def count(self) -> int:
         return int(self._all("SELECT COUNT(*) FROM jobs")[0][0])
@@ -189,7 +240,11 @@ class HistoryStore:
                 ver = probe.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
                 if not ver or int(ver[0]) > SCHEMA_VERSION:
                     raise HistoryError("history in the snapshot has an unsupported schema version")
-                cols = ", ".join(COLUMNS)
+                have = {r[1] for r in probe.execute("PRAGMA table_info(jobs)")}
+                src_cols = tuple(c for c in COLUMNS if c in have)      # a version-1 snapshot has no description/source/output_bytes
+                if "seq" not in src_cols or "job_id" not in src_cols or "command" not in src_cols:
+                    raise HistoryError("history in the snapshot has an unexpected layout")
+                cols = ", ".join(src_cols)
                 rows = probe.execute(f"SELECT {cols} FROM jobs ORDER BY seq").fetchall()
             except (sqlite3.Error, ValueError) as err:
                 raise HistoryError(f"history in the snapshot could not be read: {err}") from err
@@ -203,10 +258,13 @@ class HistoryStore:
                         # Attempts recorded here before the import (e.g. commands refused while the session was
                         # still restoring) are kept and ordered AFTER the restored history.
                         local = [list(r) for r in db.execute(f"SELECT {', '.join(COLUMNS)} FROM jobs ORDER BY seq")]
+                        if "source" in src_cols:
+                            xi = src_cols.index("source")
+                            rows = [[("dash" if v == "dash" else "mcp") if i == xi else v for i, v in enumerate(r)] for r in rows]
                         db.execute("DELETE FROM jobs")
                         db.execute("DELETE FROM sqlite_sequence WHERE name='jobs'")
-                        marks = ",".join("?" for _ in COLUMNS)
-                        si, ei = COLUMNS.index("status"), COLUMNS.index("ended_at")
+                        marks = ",".join("?" for _ in src_cols)
+                        si, ei = src_cols.index("status"), src_cols.index("ended_at")
                         for r in rows:
                             values = list(r)
                             if values[si] == "running":
@@ -231,10 +289,28 @@ class HistoryStore:
                 pass
 
 
+def clean_description(text: Optional[str]) -> Optional[str]:
+    """A one-line label chosen by the caller: control characters out, trimmed, capped. Empty becomes None."""
+    if not text:
+        return None
+    one = "".join(" " if ord(c) < 32 or ord(c) == 127 else c for c in str(text)).strip()
+    return one[:MAX_DESCRIPTION_CHARS] or None
+
+
+def list_view(row: dict) -> dict:
+    """A row as the list and the live stream show it: the command is cut to 300 characters (see /history/{id})."""
+    v = public_view(row, with_command=False)
+    cmd = row["command"]
+    v["command"] = cmd if len(cmd) <= 300 else cmd[:300] + "..."
+    v["command_chars"] = len(cmd)
+    return v
+
+
 def public_view(row: dict, with_command: bool = True) -> dict:
     """What the API shows for a history row."""
     out = {
-        "job_id": row["job_id"], "kind": row["kind"], "replay_of": row["replay_of"], "outcome": row["outcome"],
+        "seq": row["seq"], "description": row.get("description"), "source": row.get("source") or "mcp",
+        "output_bytes": row.get("output_bytes"), "job_id": row["job_id"], "kind": row["kind"], "replay_of": row["replay_of"], "outcome": row["outcome"],
         "reject_reason": row["reject_reason"], "status": row["status"], "exit_code": row["exit_code"],
         "cwd": row["cwd"], "submitted_at": row["submitted_at"], "ended_at": row["ended_at"],
         "timeout_seconds": row["timeout_seconds"],

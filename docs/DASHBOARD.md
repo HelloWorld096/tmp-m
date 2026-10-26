@@ -3,14 +3,19 @@
 Static page (`dashboard/index.html`, Vercel) + Worker API (`/dash/*`, `worker/src/dashboard.ts`). Not an MCP tool, so the
 LLM never sees session names or the snapshot repository.
 
-## Status (P1 done, P2-P5 not built)
-Works: list sessions (own names, snapshot seq/size/time/repo), rename, start / fresh / save / deep save / stop, view runner
-history and saved failed commands (view only, nothing runs).
-Not built: parallel owner commands (P2), `.swarm` browser (P3), live read-only output (P4), snapshot picker (P5).
+## Status (round 3)
+Works: sessions (own names, start / resume / save / deep save / stop), **command history** (VM history merged with the Worker's saved
+commands, keyset paging, filters, detail with request and response, paged full output), **the dashboard's own command lane**
+(`POST /dash/bash`, up to 4 at once, independent of MCP commands, cancel only its own), **VM activity phases** (paused, capturing,
+chunk n of N, committing...), and a **live view** over one WebSocket (LiveHub Durable Object, hibernation, 3 viewers, 30 minute cap,
+signed 30 s ticket, the agent dials out and sends about one frame a second only while someone watches). UI: Tailwind v4 single page
+(`dashboard/`, tabs Live, Commands, Terminal, Sessions). Verified with a mock Worker in headless Chromium under the real CSP: lazy loading
+requests the next page by cursor, live frames cause zero HTTP calls to the Worker, axe reports no violations (light and dark, phone and desktop).
+Not built: `.swarm` browser, snapshot picker, Cloudflare Access (see decisions below). **Never run against a deployed Worker or a real VM.**
 
 ## Setup (owner actions; cannot be done from the VM)
 1. `wrangler d1 create` (prod + staging); put `database_id` in `wrangler.jsonc` and `wrangler.local.jsonc`.
-2. `wrangler d1 migrations apply remote-linux-vm-db --remote` (applies 0001 failed commands, 0002 session names).
+2. `wrangler d1 migrations apply remote-linux-vm-db --remote` (applies 0001 failed commands, 0002 session names, 0003 descriptions).
 3. `wrangler secret put DASHBOARD_TOKEN` (random, 32+ chars; shorter keeps `/dash` switched OFF, answers 404).
 4. Set var `DASHBOARD_ORIGIN` to the exact dashboard origin (`https://dash.example.com`, no path, no trailing slash).
 5. Create a Vercel project from `dashboard/` (Framework: Other, no build) and attach the domain.
@@ -34,7 +39,7 @@ Not built: parallel owner commands (P2), `.swarm` browser (P3), live read-only o
    those). The Worker should also verify the `Cf-Access-Jwt-Assertion` JWT (team domain + AUD) so it still refuses requests
    that reach it some other way (workers.dev). The Vercel deployment then becomes optional. P1 as committed works
    standalone (token + Origin) until P2.
-2. **DECIDED - Live view (P4): Worker streaming proxy, not browser->runner.** Browser -> Worker `/dash/live/:job` (same
+2. **SUPERSEDED by the LiveHub WebSocket (round 3).** The earlier decision was a Worker streaming proxy: Browser -> Worker `/dash/live/:job` (same
    Origin+token check) -> Worker streams from the agent through the tunnel it already uses. The runner is never exposed to
    browsers and no ticket scheme is needed. Use `fetch()` streaming (not `EventSource`, which cannot send an Authorization
    header). It is read-only by construction; SSE-style one-way streaming is simpler and safer than a WebSocket for this.
